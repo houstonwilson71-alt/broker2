@@ -82,11 +82,13 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("MAX_RUG_SCORE: %w", err)
 	}
-	cfg.TakeProfit1Pct, err = getEnvFloat("TAKE_PROFIT_1_PCT", 100)
+	// Elite strategy: +200% TP 50%, trailing for remaining 50%, break-even SL.
+	// cfg.TakeProfit1Pct/TrailingStopPct are kept for monitor backward compatibility.
+	cfg.TakeProfit1Pct, err = getEnvFloat("TAKE_PROFIT_1_PCT", 200)
 	if err != nil {
 		return nil, fmt.Errorf("TAKE_PROFIT_1_PCT: %w", err)
 	}
-	cfg.TrailingStopPct, err = getEnvFloat("TRAILING_STOP_PCT", 25)
+	cfg.TrailingStopPct, err = getEnvFloat("TRAILING_STOP_PCT", 20)
 	if err != nil {
 		return nil, fmt.Errorf("TRAILING_STOP_PCT: %w", err)
 	}

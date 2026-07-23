@@ -4,6 +4,7 @@ RUN apk add --no-cache git ca-certificates gcc musl-dev
 
 WORKDIR /build
 
+ENV GOPROXY=https://proxy.golang.org,direct
 COPY go.mod go.sum ./
 RUN go mod download
 

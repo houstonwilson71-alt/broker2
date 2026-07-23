@@ -46,10 +46,16 @@ const (
 	WBNBAddr      = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"
 	wbnbAddrLower = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"
 
+	// Elite safeguards
+	eliteLiquidityFloorUSD = 50000.0 // $50k minimum pool liquidity
+	eliteMaxTaxPct         = 15.0    // reject if tax > 15% (bnb back < 85%)
+	eliteMinRoundTripRatio = 0.85    // bnb back / bnb in
+
 	// Stablecoin addresses (BSC, all 18 decimals)
 	USDTAddr = "0x55d398326f99059fF775485246999027B3197955"
 	BUSDAddr = "0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56"
 	USDCAddr = "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d"
+
 	// Variable-price quote tokens
 	ETHAddr  = "0x2170Ed0880ac9A755fd29B2688956BD959F933F8"
 	CAKEAddr = "0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82"
@@ -271,8 +277,8 @@ func (e *Engine) processEvent(ctx context.Context, event *listener.NewPairEvent)
 	go func() {
 		checkCtx, c := context.WithTimeout(filterCtx, 3*time.Second)
 		defer c()
-		hp, err := e.checkHoneypot(checkCtx, memeToken, event.PairAddress, quoteToken)
-		honeypotCh <- checkResult{"honeypot", err, hp}
+		hp, taxPct, err := e.checkHoneypot(checkCtx, memeToken, event.PairAddress, quoteToken)
+		honeypotCh <- checkResult{"honeypot", err, map[string]interface{}{"honeypot": hp, "tax_pct": taxPct}}
 	}()
 
 	failReasons := []string{}
@@ -302,7 +308,7 @@ func (e *Engine) processEvent(ctx context.Context, event *listener.NewPairEvent)
 			} else {
 				liq := res.val.(float64)
 				result.LiquidityUSD = liq
-				if liq < e.cfg.MinLiquidityUSD {
+				if liq < e.cfg.MinLiquidityUSD || liq < eliteLiquidityFloorUSD {
 					failReasons = append(failReasons, fmt.Sprintf("low_liquidity:$%.0f", liq))
 					passed = false
 				}
@@ -327,12 +333,19 @@ func (e *Engine) processEvent(ctx context.Context, event *listener.NewPairEvent)
 
 		case "honeypot":
 			if res.err != nil {
-				e.logger.Warn("honeypot check error", zap.Error(res.err))
+				failReasons = append(failReasons, fmt.Sprintf("prebuy_sim_error:%v", res.err))
+				passed = false
 			} else {
-				isHP := res.val.(bool)
+				meta := res.val.(map[string]interface{})
+				isHP := meta["honeypot"].(bool)
+				taxPct := meta["tax_pct"].(float64)
 				result.IsHoneypot = isHP
 				if isHP {
 					failReasons = append(failReasons, "honeypot_detected")
+					passed = false
+				}
+				if taxPct > eliteMaxTaxPct {
+					failReasons = append(failReasons, fmt.Sprintf("high_tax:%.1f%%", taxPct))
 					passed = false
 				}
 			}
@@ -752,9 +765,13 @@ func (e *Engine) getTokenInfo(ctx context.Context, tokenAddress string) (tokenIn
 
 // ─── Honeypot simulation ──────────────────────────────────────────────────────
 
-// checkHoneypot simulates buy then sell. The path uses the actual quote token
-// so we accurately test the route the executor will use.
-func (e *Engine) checkHoneypot(ctx context.Context, tokenAddress, pairAddress, quoteToken string) (bool, error) {
+// checkHoneypot performs a static pre-buy simulation (eth_call) of the
+// exact buy route followed by an immediate sell of 100% of the output.
+// It returns (isBad, taxPct, error):
+//   - isBad  : true if the sell path reverts or returns zero (honeypot).
+//   - taxPct : implied round-trip tax percentage (100 - ratio*100).
+//   - error  : non-nil if the simulation itself could not be completed.
+func (e *Engine) checkHoneypot(ctx context.Context, tokenAddress, pairAddress, quoteToken string) (bool, float64, error) {
 	routerAddr := common.HexToAddress(RouterAddress)
 	tokenAddr := common.HexToAddress(tokenAddress)
 	wbnbAddr := common.HexToAddress(WBNBAddr)
@@ -773,49 +790,54 @@ func (e *Engine) checkHoneypot(ctx context.Context, tokenAddress, pairAddress, q
 		sellPath = []common.Address{tokenAddr, quoteAddr, wbnbAddr}
 	}
 
+	// 1. Simulate buy: get expected token output for 0.001 BNB
 	buyData, err := e.routerABI.Pack("getAmountsOut", testAmountIn, buyPath)
 	if err != nil {
-		return false, err
+		return false, 0, err
 	}
 	e.acquireRPC()
 	buyResult, err := e.rpc.CallContract(ctx, ethereum.CallMsg{To: &routerAddr, Data: buyData}, nil)
 	if err != nil {
-		return false, nil // no direct route yet — not necessarily honeypot
+		// No direct route yet — not necessarily a honeypot, just not tradable.
+		return false, 0, nil
 	}
 	var buyAmounts []*big.Int
 	if err := e.routerABI.UnpackIntoInterface(&buyAmounts, "getAmountsOut", buyResult); err != nil {
-		return true, nil
+		return true, 0, nil
 	}
 	if len(buyAmounts) < 2 || buyAmounts[len(buyAmounts)-1].Sign() == 0 {
-		return true, nil
+		return true, 0, nil
 	}
 	tokensReceived := buyAmounts[len(buyAmounts)-1]
 
+	// 2. Simulate sell: immediately sell 100% of tokensReceived back to BNB
 	sellData, err := e.routerABI.Pack("getAmountsOut", tokensReceived, sellPath)
 	if err != nil {
-		return false, nil
+		return false, 0, nil
 	}
 	e.acquireRPC()
 	sellResult, err := e.rpc.CallContract(ctx, ethereum.CallMsg{To: &routerAddr, Data: sellData}, nil)
 	if err != nil {
-		return true, nil // sell reverts → honeypot
+		// Sell reverts → honeypot
+		return true, 0, nil
 	}
 	var sellAmounts []*big.Int
 	if err := e.routerABI.UnpackIntoInterface(&sellAmounts, "getAmountsOut", sellResult); err != nil {
-		return true, nil
+		return true, 0, nil
 	}
 	if len(sellAmounts) < 2 || sellAmounts[len(sellAmounts)-1].Sign() == 0 {
-		return true, nil
+		return true, 0, nil
 	}
 
-	// Effective round-trip: bnbBack / bnbIn
+	// 3. Effective round-trip: bnbBack / bnbIn
 	bnbBack := new(big.Float).SetInt(sellAmounts[len(sellAmounts)-1])
 	bnbIn := new(big.Float).SetInt(testAmountIn)
 	ratio, _ := new(big.Float).Quo(bnbBack, bnbIn).Float64()
-	if ratio < 0.5 {
-		return true, fmt.Errorf("sell_tax_%.0f%%", (1-ratio)*100)
-	}
-	return false, nil
+	taxPct := (1 - ratio) * 100
+
+	// Honeypot if sell reverts/returns zero OR round-trip is unusably low.
+	isBad := ratio < eliteMinRoundTripRatio
+	return isBad, taxPct, nil
 }
 
 // ─── BSCscan data ─────────────────────────────────────────────────────────────

@@ -304,6 +304,31 @@ func (ex *Executor) executeBuy(ctx context.Context, tok *filter.ApprovedToken, i
 		return
 	}
 
+	// Gas reserve: wallet must keep at least 0.01 BNB for sells / gas.
+	balCtx, bCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer bCancel()
+	ex.acquireRPC()
+	bal, err := ex.rpc.BalanceAt(balCtx, ex.fromAddr, nil)
+	if err == nil {
+		balF, _ := new(big.Float).Quo(new(big.Float).SetInt(bal), new(big.Float).SetFloat64(1e18)).Float64()
+		if balF < 0.01 {
+			ex.logger.Warn("WALLET ARMOR: BNB balance below 0.01, skipping buy",
+				zap.String("token", tok.TokenAddress),
+				zap.String("symbol", tok.TokenSymbol),
+				zap.Float64("bnb_balance", balF),
+			)
+			_, _ = ex.db.InsertTrade(ctx, &db.Trade{
+				TokenAddress: tok.TokenAddress,
+				PairAddress:  tok.PairAddress,
+				Side:         "buy",
+				AmountBNB:    0,
+				Status:       "failed",
+				ErrorMsg:     fmt.Sprintf("gas_reserve: balance %.6f BNB < 0.01", balF),
+			})
+			return
+		}
+	}
+
 	slippage := ex.cfg.SlippageBPS
 	gasMultiplier := int64(15) // 1.5x
 	if isRetry {
@@ -704,6 +729,28 @@ func (ex *Executor) ExecuteSell(ctx context.Context, pos *db.Position, pct int) 
 	}
 	if tradeID > 0 {
 		_ = ex.db.UpdateTradeStatus(ctx, tradeID, sellStatus, signedTx.Hash().Hex(), "", gasUsed)
+	}
+
+	// Update position status so the DB reflects reality even for emergency/force sells.
+	if sellStatus == "confirmed" {
+		if pct >= 100 {
+			pos.Status = "closed"
+			now := time.Now()
+			pos.ClosedAt = &now
+		} else {
+			pos.Status = "partial"
+		}
+		pos.RealizedPnlBNB += pnl
+		if amtBig, ok2 := new(big.Int).SetString(pos.AmountTokens, 10); ok2 {
+			remaining := new(big.Int).Sub(amtBig, amountToSell)
+			if remaining.Sign() < 0 {
+				remaining = big.NewInt(0)
+			}
+			pos.AmountTokens = remaining.String()
+		}
+		if dbErr := ex.db.UpsertPosition(ctx, pos); dbErr != nil {
+			ex.logger.Error("update position after sell", zap.Error(dbErr), zap.String("token", pos.TokenAddress))
+		}
 	}
 
 	_ = ex.redis.Publish(ctx, redisclient.PubSubEvents, map[string]interface{}{

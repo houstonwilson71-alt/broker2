@@ -155,15 +155,22 @@ func (b *Bot) Start() error {
 
 func (b *Bot) Stop() error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if !b.running {
+		b.mu.Unlock()
 		return fmt.Errorf("not running")
 	}
+	b.logger.Warn("bot stopping — force selling all open positions first")
+
+	// Force sell every open position before shutting down components.
+	sellCtx, sellCancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	b.monitor.SellAllPositions(sellCtx)
+	sellCancel()
 
 	b.cancel()
 	b.wg.Wait()
 	b.running = false
 	b.stateStr.Store(stateIdle)
+	b.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

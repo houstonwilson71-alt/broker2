@@ -116,7 +116,7 @@ func (m *Monitor) AddPosition(pos *db.Position) {
 }
 
 func (m *Monitor) Run(ctx context.Context) {
-	ticker := time.NewTicker(200 * time.Millisecond)
+	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
 	for {
@@ -203,30 +203,34 @@ func (m *Monitor) tick(ctx context.Context) {
 			continue
 		}
 		pricePctGain := (price - entryPrice) / entryPrice * 100
-		timeOpen := time.Since(state.openedAt)
 
 		var action string
 		var sellPct int
 
 		switch {
-		// TP1: +100% → sell 50%
-		case !state.tp1Hit && pricePctGain >= m.cfg.TakeProfit1Pct:
-			action = "tp1"
+			// TP at +200%: sell exactly 50% of the held amount.
+		case !state.tp1Hit && price >= state.entryPrice*3.0:
+			action = "tp_200"
 			sellPct = 50
 			state.tp1Hit = true
 			pos.TP1Triggered = true
 
-		// Trailing stop after TP1: drawdown >= TrailingStopPct from ATH
+		// After the first 50% sell:
+		// - If price keeps rising to +300%, sell the remaining 50%.
+		// - If price drops 20% from the peak after the first sell, sell the remaining 50%.
 		case state.tp1Hit:
 			drawdown := (state.athPrice - price) / state.athPrice * 100
-			if drawdown >= m.cfg.TrailingStopPct {
+			if price >= state.entryPrice*4.0 {
+				action = "tp_300"
+				sellPct = 100
+			} else if drawdown >= 20.0 {
 				action = "trailing_stop"
 				sellPct = 100
 			}
 
-		// Time exit: >2h open and <20% gain → sell 100%
-		case timeOpen > 2*time.Hour && pricePctGain < 20:
-			action = "time_exit"
+		// Break-even stop-loss: if price drops to or below entry price, dump 100%.
+		case price <= state.entryPrice:
+			action = "breakeven_sl"
 			sellPct = 100
 		}
 
@@ -411,6 +415,47 @@ func (m *Monitor) GetPositions() []*positionState {
 		result = append(result, s)
 	}
 	return result
+}
+
+// SellAllPositions force-sells every open position at 100%. Used before the bot stops.
+func (m *Monitor) SellAllPositions(ctx context.Context) {
+	m.mu.RLock()
+	tokens := make([]string, 0, len(m.positions))
+	for t := range m.positions {
+		tokens = append(tokens, t)
+	}
+	m.mu.RUnlock()
+
+	if len(tokens) == 0 {
+		return
+	}
+
+	m.logger.Warn("FORCE SELL ALL — selling every open position", zap.Int("count", len(tokens)))
+
+	for _, tokenAddr := range tokens {
+		m.mu.RLock()
+		state, ok := m.positions[tokenAddr]
+		m.mu.RUnlock()
+		if !ok {
+			continue
+		}
+		pos := state.pos
+
+		if err := m.seller.ExecuteSell(ctx, pos, 100); err != nil {
+			m.logger.Error("force sell failed", zap.Error(err), zap.String("token", tokenAddr))
+			continue
+		}
+
+		m.mu.Lock()
+		if st, ok := m.positions[tokenAddr]; ok {
+			st.pos.Status = "closed"
+			now := time.Now()
+			st.pos.ClosedAt = &now
+			delete(m.positions, tokenAddr)
+		}
+		m.mu.Unlock()
+		_ = m.db.UpsertPosition(ctx, pos)
+	}
 }
 
 func parseBigFloat(s string) float64 {
