@@ -116,8 +116,10 @@ func (m *Monitor) AddPosition(pos *db.Position) {
 }
 
 func (m *Monitor) Run(ctx context.Context) {
-	ticker := time.NewTicker(3 * time.Second)
-	defer ticker.Stop()
+	priceTicker := time.NewTicker(3 * time.Second)
+	defer priceTicker.Stop()
+	reloadTicker := time.NewTicker(10 * time.Second)
+	defer reloadTicker.Stop()
 
 	for {
 		select {
@@ -125,9 +127,46 @@ func (m *Monitor) Run(ctx context.Context) {
 			m.logger.Info("monitor shutting down — persisting positions")
 			m.persistAllPositions()
 			return
-		case <-ticker.C:
+		case <-priceTicker.C:
 			m.tick(ctx)
+		case <-reloadTicker.C:
+			m.reloadNewPositions(ctx)
 		}
+	}
+}
+
+// reloadNewPositions periodically queries the DB for open positions that are
+// not yet tracked in memory. This catches positions created by the executor
+// after the monitor started.
+func (m *Monitor) reloadNewPositions(ctx context.Context) {
+	positions, err := m.db.ListPositions(ctx, "open")
+	if err != nil {
+		m.logger.Warn("reload positions from DB", zap.Error(err))
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	added := 0
+	for _, p := range positions {
+		if _, ok := m.positions[p.TokenAddress]; ok {
+			continue
+		}
+		entry := parseBigFloat(p.EntryPriceBNB)
+		ath := parseBigFloat(p.ATHPriceBNB)
+		if ath == 0 {
+			ath = entry
+		}
+		m.positions[p.TokenAddress] = &positionState{
+			pos:        p,
+			entryPrice: entry,
+			athPrice:   ath,
+			tp1Hit:     p.TP1Triggered,
+			openedAt:   p.OpenedAt,
+		}
+		added++
+	}
+	if added > 0 {
+		m.logger.Info("reloaded new positions from DB", zap.Int("added", added))
 	}
 }
 

@@ -28,6 +28,7 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+      network: host
     restart: unless-stopped
     # Use host networking because Docker bridge has no outbound internet access
     # in this environment; the host network can reach the BSC RPC endpoints.
