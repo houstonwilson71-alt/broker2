@@ -386,13 +386,12 @@ func (e *Engine) processEvent(ctx context.Context, event *listener.NewPairEvent)
 		passed = false
 	}
 
-	// USDT pair handling: warn, but do not auto-reject. The 2-hop simulation in
-	// checkHoneypot already validates the WBNB/USDT conversion path.
-	if strings.EqualFold(quoteToken, USDTAddr) {
-		e.logger.Warn("USDT pair approved (warning only)",
-			zap.String("token", memeToken),
-			zap.String("symbol", tInfo.symbol),
-		)
+	// Temporary mainnet test guard: only allow WBNB pairs. Stablecoins and other
+	// quote tokens (USDT, BUSD, USDC, ETH, CAKE) have repeatedly caused losses due
+		// to hidden token tax/slippage on the sell side, so they are rejected here.
+	if !strings.EqualFold(quoteToken, WBNBAddr) {
+		failReasons = append(failReasons, fmt.Sprintf("non_wbnb_quote:%s", quoteSymbol))
+		passed = false
 	}
 
 	result.Passed = passed
