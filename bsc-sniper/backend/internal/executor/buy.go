@@ -304,17 +304,20 @@ func (ex *Executor) executeBuy(ctx context.Context, tok *filter.ApprovedToken, i
 		return
 	}
 
-	// Gas reserve: wallet must keep at least 0.0095 BNB for sells / gas.
-	// NOTE: threshold lowered from 0.01 to 0.0095 because the funded wallet
-	// holds ~0.009999 BNB, just below the strict 0.01 line. This still leaves
-	// ample gas reserve (~0.0095 BNB) for multiple emergency sells.
-	const minGasReserveBNB = 0.0095
+	// Gas reserve: wallet must keep at least 0.01 BNB for sells / gas.
+	const minGasReserveBNB = 0.01
 	balCtx, bCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer bCancel()
 	ex.acquireRPC()
 	bal, err := ex.rpc.BalanceAt(balCtx, ex.fromAddr, nil)
 	if err == nil {
 		balF, _ := new(big.Float).Quo(new(big.Float).SetInt(bal), new(big.Float).SetFloat64(1e18)).Float64()
+		ex.logger.Info("wallet balance before buy",
+			zap.String("token", tok.TokenAddress),
+			zap.String("symbol", tok.TokenSymbol),
+			zap.Float64("bnb_balance", balF),
+			zap.Float64("buy_bnb", ex.cfg.BuyAmountBNB),
+		)
 		if balF < minGasReserveBNB {
 			ex.logger.Warn("WALLET ARMOR: BNB balance below gas reserve, skipping buy",
 				zap.String("token", tok.TokenAddress),

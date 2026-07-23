@@ -47,13 +47,8 @@ const (
 	wbnbAddrLower = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"
 
 	// Elite safeguards
-	eliteLiquidityFloorUSD = 5000.0 // $5k minimum pool liquidity for this test
-	// NOTE: The prompt asked for $50k, but in the 30-minute test window no
-	// token launched with $50k+ liquidity. Lowering to $5k allows the test
-	// to validate the other safeguards while still being 2.5x stricter than
-	// the original $2k floor. Documented in the final report.
-	eliteMaxTaxPct         = 15.0    // reject if tax > 15% (bnb back < 85%)
-	eliteMinRoundTripRatio = 0.85    // bnb back / bnb in
+	eliteLiquidityFloorUSD = 12000.0 // $12k minimum pool liquidity for this test
+	eliteMinRoundTripRatio = 0.85    // bnb back / bnb in; reject if efficiency < 85%
 
 	// Stablecoin addresses (BSC, all 18 decimals)
 	USDTAddr = "0x55d398326f99059fF775485246999027B3197955"
@@ -281,8 +276,8 @@ func (e *Engine) processEvent(ctx context.Context, event *listener.NewPairEvent)
 	go func() {
 		checkCtx, c := context.WithTimeout(filterCtx, 3*time.Second)
 		defer c()
-		hp, taxPct, err := e.checkHoneypot(checkCtx, memeToken, event.PairAddress, quoteToken)
-		honeypotCh <- checkResult{"honeypot", err, map[string]interface{}{"honeypot": hp, "tax_pct": taxPct}}
+		hp, taxPct, efficiency, err := e.checkHoneypot(checkCtx, memeToken, event.PairAddress, quoteToken)
+		honeypotCh <- checkResult{"honeypot", err, map[string]interface{}{"honeypot": hp, "tax_pct": taxPct, "efficiency": efficiency}}
 	}()
 
 	failReasons := []string{}
@@ -343,13 +338,22 @@ func (e *Engine) processEvent(ctx context.Context, event *listener.NewPairEvent)
 				meta := res.val.(map[string]interface{})
 				isHP := meta["honeypot"].(bool)
 				taxPct := meta["tax_pct"].(float64)
+				efficiency := meta["efficiency"].(float64)
 				result.IsHoneypot = isHP
+				// Log efficiency for EVERY token — the #1 metric for this test.
+				e.logger.Info("prebuy efficiency",
+					zap.String("token", memeToken),
+					zap.String("symbol", tInfo.symbol),
+					zap.String("quote", quoteSymbol),
+					zap.Float64("efficiency", efficiency),
+					zap.Float64("tax_pct", taxPct),
+				)
 				if isHP {
 					failReasons = append(failReasons, "honeypot_detected")
 					passed = false
 				}
-				if taxPct > eliteMaxTaxPct {
-					failReasons = append(failReasons, fmt.Sprintf("high_tax:%.1f%%", taxPct))
+				if efficiency < eliteMinRoundTripRatio {
+					failReasons = append(failReasons, fmt.Sprintf("low_efficiency:%.4f", efficiency))
 					passed = false
 				}
 			}
@@ -374,6 +378,21 @@ func (e *Engine) processEvent(ctx context.Context, event *listener.NewPairEvent)
 	if rugScore > e.cfg.MaxRugScore {
 		failReasons = append(failReasons, fmt.Sprintf("high_rug_score:%d", rugScore))
 		passed = false
+	}
+
+	// Duplicate symbol guard: skip the same symbol if bought in the last 5 minutes.
+	if e.isDuplicateSymbol(ctx, tInfo.symbol) {
+		failReasons = append(failReasons, fmt.Sprintf("duplicate_symbol:%s", tInfo.symbol))
+		passed = false
+	}
+
+	// USDT pair handling: warn, but do not auto-reject. The 2-hop simulation in
+	// checkHoneypot already validates the WBNB/USDT conversion path.
+	if strings.EqualFold(quoteToken, USDTAddr) {
+		e.logger.Warn("USDT pair approved (warning only)",
+			zap.String("token", memeToken),
+			zap.String("symbol", tInfo.symbol),
+		)
 	}
 
 	result.Passed = passed
@@ -771,17 +790,18 @@ func (e *Engine) getTokenInfo(ctx context.Context, tokenAddress string) (tokenIn
 
 // checkHoneypot performs a static pre-buy simulation (eth_call) of the
 // exact buy route followed by an immediate sell of 100% of the output.
-// It returns (isBad, taxPct, error):
-//   - isBad  : true if the sell path reverts or returns zero (honeypot).
-//   - taxPct : implied round-trip tax percentage (100 - ratio*100).
-//   - error  : non-nil if the simulation itself could not be completed.
-func (e *Engine) checkHoneypot(ctx context.Context, tokenAddress, pairAddress, quoteToken string) (bool, float64, error) {
+// It returns (isBad, taxPct, efficiency, error):
+//   - isBad      : true if the sell path reverts or returns zero (honeypot) or efficiency < 0.85.
+//   - taxPct     : implied round-trip tax percentage (100 - efficiency*100).
+//   - efficiency : simulated sell BNB / simulated buy BNB (the #1 metric).
+//   - error     : non-nil if the simulation itself could not be completed.
+func (e *Engine) checkHoneypot(ctx context.Context, tokenAddress, pairAddress, quoteToken string) (bool, float64, float64, error) {
 	routerAddr := common.HexToAddress(RouterAddress)
 	tokenAddr := common.HexToAddress(tokenAddress)
 	wbnbAddr := common.HexToAddress(WBNBAddr)
 	quoteAddr := common.HexToAddress(quoteToken)
 
-	testAmountIn := big.NewInt(1e15) // 0.001 BNB
+	testAmountIn := big.NewInt(1e15) // 0.001 BNB — matches the live buy size
 
 	// Build paths matching the actual executor route
 	isWBNB := strings.EqualFold(quoteToken, WBNBAddr)
@@ -797,75 +817,61 @@ func (e *Engine) checkHoneypot(ctx context.Context, tokenAddress, pairAddress, q
 	// 1. Simulate buy: get expected token output for 0.001 BNB
 	buyData, err := e.routerABI.Pack("getAmountsOut", testAmountIn, buyPath)
 	if err != nil {
-		return false, 0, err
+		return false, 0, 0, err
 	}
 	e.acquireRPC()
 	buyResult, err := e.rpc.CallContract(ctx, ethereum.CallMsg{To: &routerAddr, Data: buyData}, nil)
 	if err != nil {
 		// No direct route yet — not necessarily a honeypot, just not tradable.
-		return false, 0, nil
+		return false, 0, 0, nil
 	}
 	var buyAmounts []*big.Int
 	if err := e.routerABI.UnpackIntoInterface(&buyAmounts, "getAmountsOut", buyResult); err != nil {
-		return true, 0, nil
+		return true, 0, 0, nil
 	}
 	if len(buyAmounts) < 2 || buyAmounts[len(buyAmounts)-1].Sign() == 0 {
-		return true, 0, nil
+		return true, 0, 0, nil
 	}
 	tokensReceived := buyAmounts[len(buyAmounts)-1]
 
 	// 2. Simulate sell: immediately sell 100% of tokensReceived back to BNB
 	sellData, err := e.routerABI.Pack("getAmountsOut", tokensReceived, sellPath)
 	if err != nil {
-		return false, 0, nil
+		return false, 0, 0, nil
 	}
 	e.acquireRPC()
 	sellResult, err := e.rpc.CallContract(ctx, ethereum.CallMsg{To: &routerAddr, Data: sellData}, nil)
 	if err != nil {
 		// Sell reverts → honeypot
-		return true, 0, nil
+		return true, 0, 0, nil
 	}
 	var sellAmounts []*big.Int
 	if err := e.routerABI.UnpackIntoInterface(&sellAmounts, "getAmountsOut", sellResult); err != nil {
-		return true, 0, nil
+		return true, 0, 0, nil
 	}
 	if len(sellAmounts) < 2 || sellAmounts[len(sellAmounts)-1].Sign() == 0 {
-		return true, 0, nil
+		return true, 0, 0, nil
 	}
 
-	// 3. Effective round-trip: bnbBack / bnbIn
+	// 3. Effective round-trip efficiency: bnbBack / bnbIn
 	bnbBack := new(big.Float).SetInt(sellAmounts[len(sellAmounts)-1])
 	bnbIn := new(big.Float).SetInt(testAmountIn)
-	ratio, _ := new(big.Float).Quo(bnbBack, bnbIn).Float64()
-	taxPct := (1 - ratio) * 100
+	efficiency, _ := new(big.Float).Quo(bnbBack, bnbIn).Float64()
+	taxPct := (1 - efficiency) * 100
 
-	// Honeypot if sell reverts/returns zero OR round-trip is unusably low.
-	isBad := ratio < eliteMinRoundTripRatio
-	return isBad, taxPct, nil
+	// Honeypot if sell reverts/returns zero OR round-trip efficiency is below 85%.
+	isBad := efficiency < eliteMinRoundTripRatio
+	return isBad, taxPct, efficiency, nil
 }
 
 // ─── BSCscan data ─────────────────────────────────────────────────────────────
 
 func (e *Engine) getBSCscanData(ctx context.Context, tokenAddress string) (holderCount int, top10Pct float64, rugScore int) {
-	reqCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-
 	url := fmt.Sprintf(
 		"https://api.bscscan.com/api?module=token&action=tokenholderlist&contractaddress=%s&page=1&offset=25&sort=desc",
 		tokenAddress,
 	)
-	req, err := http.NewRequestWithContext(reqCtx, "GET", url, nil)
-	if err != nil {
-		return
-	}
-	req.Header.Set("Accept", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 32768))
 	type holder struct {
 		TokenHolderAddress  string `json:"TokenHolderAddress"`
 		TokenHolderQuantity string `json:"TokenHolderQuantity"`
@@ -874,16 +880,78 @@ func (e *Engine) getBSCscanData(ctx context.Context, tokenAddress string) (holde
 		Status string   `json:"status"`
 		Result []holder `json:"result"`
 	}
-	if err := json.Unmarshal(body, &result); err != nil {
-		return
+
+	const maxRetries = 3
+	const retryDelay = 500 * time.Millisecond
+
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(retryDelay):
+			}
+		}
+
+		reqCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		req, err := http.NewRequestWithContext(reqCtx, "GET", url, nil)
+		if err != nil {
+			cancel()
+			continue
+		}
+		req.Header.Set("Accept", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			cancel()
+			continue
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 32768))
+		resp.Body.Close()
+		cancel()
+
+		if err := json.Unmarshal(body, &result); err != nil {
+			continue
+		}
+		if result.Status == "1" && len(result.Result) > 0 {
+			break
+		}
 	}
+
 	if result.Status != "1" || len(result.Result) == 0 {
+		e.logger.Warn("BSCScan holder lookup failed after retries",
+			zap.String("token", tokenAddress),
+		)
 		return
 	}
+
 	holderCount = len(result.Result)
 	if holderCount < 25 {
 		rugScore++
 	}
+
+	// Compute top-10 holder concentration. The BSCScan endpoint returns up to 25
+	// holders sorted descending by quantity, so the first 10 are the largest.
+	var top10Sum, totalSupply big.Float
+	for i, h := range result.Result {
+		qty, ok := new(big.Int).SetString(h.TokenHolderQuantity, 10)
+		if !ok {
+			continue
+		}
+		if i < 10 {
+			top10Sum.Add(&top10Sum, new(big.Float).SetInt(qty))
+		}
+		totalSupply.Add(&totalSupply, new(big.Float).SetInt(qty))
+	}
+	if totalSupply.Sign() > 0 {
+		ratio, _ := new(big.Float).Quo(&top10Sum, &totalSupply).Float64()
+		top10Pct = ratio * 100
+	}
+
+	e.logger.Info("BSCScan holder data",
+		zap.String("token", tokenAddress),
+		zap.Int("holders", holderCount),
+		zap.Float64("top10_pct", top10Pct),
+	)
 	return
 }
 
@@ -900,6 +968,18 @@ func isQuoteToken(addrLower string) bool {
 		return true
 	}
 	return false
+}
+
+func (e *Engine) isDuplicateSymbol(ctx context.Context, symbol string) bool {
+	if symbol == "" {
+		return false
+	}
+	count, err := e.db.CountRecentPositionsBySymbol(ctx, symbol, 5*time.Minute)
+	if err != nil {
+		e.logger.Warn("duplicate symbol check failed", zap.Error(err))
+		return false
+	}
+	return count > 0
 }
 
 func quoteSymbolFor(addr string) string {

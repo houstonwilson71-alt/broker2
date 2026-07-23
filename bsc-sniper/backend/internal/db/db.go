@@ -240,6 +240,15 @@ func (d *DB) UpsertPosition(ctx context.Context, p *Position) error {
 	return err
 }
 
+func (d *DB) CountRecentPositionsBySymbol(ctx context.Context, symbol string, window time.Duration) (int64, error) {
+	var count int64
+	err := d.Pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM positions
+		WHERE token_symbol = $1 AND opened_at > NOW() - $2::interval
+	`, symbol, window).Scan(&count)
+	return count, err
+}
+
 func (d *DB) ListPositions(ctx context.Context, status string) ([]*Position, error) {
 	query := `
 		SELECT id, token_address, pair_address, token_symbol,
