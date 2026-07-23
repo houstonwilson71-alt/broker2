@@ -186,26 +186,21 @@ func (b *Bot) EmergencyStop(ctx context.Context) error {
 	if err != nil {
 		b.logger.Error("list positions for emergency sell", zap.Error(err))
 	} else {
-		var sellWG sync.WaitGroup
+		// Sell sequentially to avoid nonce collisions from parallel tx submission.
 		for _, pos := range positions {
-			p := pos
-			sellWG.Add(1)
-			go func() {
-				defer sellWG.Done()
-				if err := b.executor.ExecuteSell(sellCtx, p, 100); err != nil {
-					b.logger.Error("emergency sell failed",
-						zap.String("token", p.TokenAddress),
-						zap.Error(err),
-					)
-				} else {
-					b.logger.Info("emergency sell completed",
-						zap.String("token", p.TokenAddress),
-						zap.String("symbol", p.TokenSymbol),
-					)
-				}
-			}()
+			if err := b.executor.ExecuteSell(sellCtx, pos, 100); err != nil {
+				b.logger.Error("emergency sell failed",
+					zap.String("token", pos.TokenAddress),
+					zap.String("symbol", pos.TokenSymbol),
+					zap.Error(err),
+				)
+			} else {
+				b.logger.Info("emergency sell completed",
+					zap.String("token", pos.TokenAddress),
+					zap.String("symbol", pos.TokenSymbol),
+				)
+			}
 		}
-		sellWG.Wait()
 	}
 
 	if b.IsRunning() {

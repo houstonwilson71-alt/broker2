@@ -8,6 +8,8 @@ services:
       POSTGRES_DB: sniper
     volumes:
       - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
     networks:
       - sniper
 
@@ -17,6 +19,8 @@ services:
     command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru --save ""
     volumes:
       - redis_data:/data
+    ports:
+      - "6379:6379"
     networks:
       - sniper
 
@@ -25,19 +29,18 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     restart: unless-stopped
+    # Use host networking because Docker bridge has no outbound internet access
+    # in this environment; the host network can reach the BSC RPC endpoints.
+    network_mode: host
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgres://sniper:sniper@postgres:5432/sniper?sslmode=disable
-      REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgres://sniper:sniper@localhost:5432/sniper?sslmode=disable
+      REDIS_URL: redis://localhost:6379/0
       API_PORT: "8080"
-    ports:
-      - "8080:8080"
     depends_on:
       - postgres
       - redis
-    networks:
-      - sniper
 
   frontend:
     build:
