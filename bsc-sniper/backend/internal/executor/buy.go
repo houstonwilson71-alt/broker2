@@ -580,7 +580,8 @@ func (ex *Executor) dualSubmit(ctx context.Context, tx *types.Transaction) error
 }
 
 // ExecuteSell sells pct% of the position using the correct reverse path.
-func (ex *Executor) ExecuteSell(ctx context.Context, pos *db.Position, pct int) error {
+// sellType is "tp_50", "tp_300", "trailing_sl", "breakeven_sl", "breakeven_sl_partial", or "force".
+func (ex *Executor) ExecuteSell(ctx context.Context, pos *db.Position, pct int, sellType string) error {
 	if !ex.cfg.LiveTradingEnabled {
 		ex.logger.Info("SIMULATED SELL",
 			zap.String("token", pos.TokenAddress),
@@ -638,7 +639,8 @@ func (ex *Executor) ExecuteSell(ctx context.Context, pos *db.Position, pct int) 
 		return fmt.Errorf("unpack sell amounts: %w", err)
 	}
 	expectedBNB := amounts[len(amounts)-1]
-	amountOutMin := new(big.Int).Mul(expectedBNB, big.NewInt(int64(10000-ex.cfg.SlippageBPS)))
+	// Strict slippage protection: allow only 5% output slippage on every sell.
+	amountOutMin := new(big.Int).Mul(expectedBNB, big.NewInt(9500))
 	amountOutMin.Div(amountOutMin, big.NewInt(10000))
 
 	deadline := big.NewInt(time.Now().Add(2 * time.Minute).Unix())
@@ -663,6 +665,11 @@ func (ex *Executor) ExecuteSell(ctx context.Context, pos *db.Position, pct int) 
 	}
 	gasPrice := new(big.Int).Mul(suggestedGasPrice, big.NewInt(15))
 	gasPrice.Div(gasPrice, big.NewInt(10))
+	// Gas boost for take-profit sells to beat front-runners.
+	if strings.HasPrefix(sellType, "tp_") || sellType == "trailing_sl" {
+		gasPrice = new(big.Int).Mul(gasPrice, big.NewInt(15))
+		gasPrice.Div(gasPrice, big.NewInt(10))
+	}
 
 	defaultGasLimit := uint64(300000)
 	if len(sellPath) > 2 {
@@ -680,46 +687,79 @@ func (ex *Executor) ExecuteSell(ctx context.Context, pos *db.Position, pct int) 
 	}
 	gasLimit = gasLimit * 13 / 10
 
-	tx := types.NewTransaction(nonce, routerAddr, nil, gasLimit, gasPrice, txData)
-	signer := types.NewEIP155Signer(ex.chainID)
-	signedTx, err := types.SignTx(tx, signer, ex.privateKey)
-	if err != nil {
-		return fmt.Errorf("sign sell: %w", err)
-	}
-
-	gasPriceGwei, _ := new(big.Float).Quo(
-		new(big.Float).SetInt(gasPrice), new(big.Float).SetFloat64(1e9)).Float64()
 	bnbReceived, _ := new(big.Float).Quo(
 		new(big.Float).SetInt(expectedBNB), new(big.Float).SetFloat64(1e18)).Float64()
 	currentPricePerToken, _ := new(big.Float).Quo(
 		new(big.Float).SetInt(expectedBNB), new(big.Float).SetInt(amountToSell)).Float64()
 	pnl := bnbReceived - (ex.cfg.BuyAmountBNB * float64(pct) / 100)
 
-	tradeID, _ := ex.db.InsertTrade(ctx, &db.Trade{
-		TokenAddress: pos.TokenAddress,
-		PairAddress:  pos.PairAddress,
-		Side:         "sell",
-		AmountBNB:    bnbReceived,
-		AmountTokens: amountToSell.String(),
-		PriceBNB:     fmt.Sprintf("%.18f", currentPricePerToken),
-		TxHash:       signedTx.Hash().Hex(),
-		GasPriceGwei: gasPriceGwei,
-		Status:       "pending",
-	})
-
-	ex.acquireRPC()
-	if err := ex.rpc.SendTransaction(ctx, signedTx); err != nil {
-		if tradeID > 0 {
-			_ = ex.db.UpdateTradeStatus(ctx, tradeID, "failed", "", err.Error(), 0)
+	// Attempt the sell once; if it fails or reverts, retry with 1.5x gas.
+	var signedTx *types.Transaction
+	signer := types.NewEIP155Signer(ex.chainID)
+	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			gasPrice = new(big.Int).Mul(gasPrice, big.NewInt(15))
+			gasPrice.Div(gasPrice, big.NewInt(10))
+			ex.nonceMu.Lock()
+			ex.acquireRPC()
+			nonce, _ = ex.rpc.PendingNonceAt(ctx, ex.fromAddr)
+			ex.nonceMu.Unlock()
+			ex.logger.Warn("sell retry with 1.5x gas",
+				zap.String("token", pos.TokenAddress),
+				zap.String("symbol", pos.TokenSymbol),
+				zap.Int("attempt", attempt+1),
+			)
 		}
-		return fmt.Errorf("send sell: %w", err)
+
+		tx := types.NewTransaction(nonce, routerAddr, nil, gasLimit, gasPrice, txData)
+		var signErr error
+		signedTx, signErr = types.SignTx(tx, signer, ex.privateKey)
+		if signErr != nil {
+			if attempt == 0 {
+				return fmt.Errorf("sign sell: %w", signErr)
+			}
+			break
+		}
+
+		ex.acquireRPC()
+		sendErr := ex.rpc.SendTransaction(ctx, signedTx)
+		if sendErr == nil {
+			receiptCtx, rCancel := context.WithTimeout(ctx, 60*time.Second)
+			receipt := ex.waitForReceipt(receiptCtx, signedTx.Hash())
+			rCancel()
+			if receipt != nil && receipt.Status == 1 {
+				break // success
+			}
+			if receipt != nil && receipt.Status == 0 {
+				ex.logger.Warn("sell tx reverted, retrying with 1.5x gas",
+					zap.String("token", pos.TokenAddress),
+					zap.String("tx_hash", signedTx.Hash().Hex()),
+				)
+			}
+		} else {
+			ex.logger.Warn("send sell failed, retrying with 1.5x gas",
+				zap.String("token", pos.TokenAddress),
+				zap.Error(sendErr),
+			)
+		}
+		if attempt == 1 {
+			return fmt.Errorf("send sell failed after retry: %s", sendErr)
+		}
 	}
+
+	if signedTx == nil {
+		return fmt.Errorf("sell transaction could not be built")
+	}
+
+	gasPriceGwei, _ := new(big.Float).Quo(
+		new(big.Float).SetInt(gasPrice), new(big.Float).SetFloat64(1e9)).Float64()
 
 	ex.logger.Info("Sell executed",
 		zap.String("token", pos.TokenAddress),
 		zap.String("symbol", pos.TokenSymbol),
 		zap.String("tx_hash", signedTx.Hash().Hex()),
 		zap.Int("pct", pct),
+		zap.String("sell_type", sellType),
 		zap.Float64("bnb_received", bnbReceived),
 		zap.Float64("pnl_bnb", pnl),
 	)
@@ -735,9 +775,19 @@ func (ex *Executor) ExecuteSell(ctx context.Context, pos *db.Position, pct int) 
 			sellStatus = "reverted"
 		}
 	}
-	if tradeID > 0 {
-		_ = ex.db.UpdateTradeStatus(ctx, tradeID, sellStatus, signedTx.Hash().Hex(), "", gasUsed)
-	}
+
+	_, _ = ex.db.InsertTrade(ctx, &db.Trade{
+		TokenAddress: pos.TokenAddress,
+		PairAddress:  pos.PairAddress,
+		Side:         "sell",
+		AmountBNB:    bnbReceived,
+		AmountTokens: amountToSell.String(),
+		PriceBNB:     fmt.Sprintf("%.18f", currentPricePerToken),
+		TxHash:       signedTx.Hash().Hex(),
+		GasPriceGwei: gasPriceGwei,
+		Status:       sellStatus,
+		GasUsed:      gasUsed,
+	})
 
 	// Update position status so the DB reflects reality even for emergency/force sells.
 	if sellStatus == "confirmed" {

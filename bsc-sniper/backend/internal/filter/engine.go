@@ -48,7 +48,7 @@ const (
 
 	// Elite safeguards
 	eliteLiquidityFloorUSD = 12000.0 // $12k minimum pool liquidity for this test
-	eliteMinRoundTripRatio = 0.85    // bnb back / bnb in; reject if efficiency < 85%
+	eliteMinRoundTripRatio = 0.95    // bnb back / bnb in; reject if efficiency < 95%
 
 	// Stablecoin addresses (BSC, all 18 decimals)
 	USDTAddr = "0x55d398326f99059fF775485246999027B3197955"
@@ -791,7 +791,7 @@ func (e *Engine) getTokenInfo(ctx context.Context, tokenAddress string) (tokenIn
 // checkHoneypot performs a static pre-buy simulation (eth_call) of the
 // exact buy route followed by an immediate sell of 100% of the output.
 // It returns (isBad, taxPct, efficiency, error):
-//   - isBad      : true if the sell path reverts or returns zero (honeypot) or efficiency < 0.85.
+//   - isBad      : true if the sell path reverts or returns zero (honeypot) or efficiency < 0.95.
 //   - taxPct     : implied round-trip tax percentage (100 - efficiency*100).
 //   - efficiency : simulated sell BNB / simulated buy BNB (the #1 metric).
 //   - error     : non-nil if the simulation itself could not be completed.

@@ -211,6 +211,7 @@ type Position struct {
 	CostBNB          float64
 	RealizedPnlBNB   float64
 	TP1Triggered     bool
+	TP2Done          bool
 	Status           string
 	OpenedAt         time.Time
 	ClosedAt         *time.Time
@@ -224,19 +225,20 @@ func (d *DB) UpsertPosition(ctx context.Context, p *Position) error {
 	_, err := d.Pool.Exec(ctx, `
 		INSERT INTO positions
 		  (token_address, pair_address, token_symbol, quote_token, entry_price_bnb, current_price_bnb,
-		   ath_price_bnb, amount_tokens, cost_bnb, realized_pnl_bnb, tp1_triggered, status, closed_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+		   ath_price_bnb, amount_tokens, cost_bnb, realized_pnl_bnb, tp1_triggered, tp2_done, status, closed_at)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
 		ON CONFLICT (token_address) DO UPDATE SET
 		  current_price_bnb=EXCLUDED.current_price_bnb,
 		  ath_price_bnb=EXCLUDED.ath_price_bnb,
 		  amount_tokens=EXCLUDED.amount_tokens,
 		  realized_pnl_bnb=EXCLUDED.realized_pnl_bnb,
 		  tp1_triggered=EXCLUDED.tp1_triggered,
+		  tp2_done=EXCLUDED.tp2_done,
 		  status=EXCLUDED.status,
 		  closed_at=EXCLUDED.closed_at,
 		  cost_bnb=EXCLUDED.cost_bnb
 	`, p.TokenAddress, p.PairAddress, p.TokenSymbol, qt, p.EntryPriceBNB, p.CurrentPriceBNB,
-		p.ATHPriceBNB, p.AmountTokens, p.CostBNB, p.RealizedPnlBNB, p.TP1Triggered, p.Status, p.ClosedAt)
+		p.ATHPriceBNB, p.AmountTokens, p.CostBNB, p.RealizedPnlBNB, p.TP1Triggered, p.TP2Done, p.Status, p.ClosedAt)
 	return err
 }
 
@@ -254,7 +256,7 @@ func (d *DB) ListPositions(ctx context.Context, status string) ([]*Position, err
 		SELECT id, token_address, pair_address, token_symbol,
 		       COALESCE(quote_token, '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095b'),
 		       entry_price_bnb, current_price_bnb, ath_price_bnb, amount_tokens, cost_bnb,
-		       realized_pnl_bnb, tp1_triggered, status, opened_at, closed_at
+		       realized_pnl_bnb, tp1_triggered, tp2_done, status, opened_at, closed_at
 		FROM positions`
 	args := []interface{}{}
 	if status != "" {
@@ -275,7 +277,7 @@ func (d *DB) ListPositions(ctx context.Context, status string) ([]*Position, err
 		if err := rows.Scan(&p.ID, &p.TokenAddress, &p.PairAddress, &p.TokenSymbol,
 			&p.QuoteToken,
 			&p.EntryPriceBNB, &p.CurrentPriceBNB, &p.ATHPriceBNB, &p.AmountTokens,
-			&p.CostBNB, &p.RealizedPnlBNB, &p.TP1Triggered, &p.Status,
+			&p.CostBNB, &p.RealizedPnlBNB, &p.TP1Triggered, &p.TP2Done, &p.Status,
 			&p.OpenedAt, &p.ClosedAt); err != nil {
 			return nil, err
 		}

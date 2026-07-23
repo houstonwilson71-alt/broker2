@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS positions (
     cost_bnb        NUMERIC(20,8) NOT NULL,
     realized_pnl_bnb NUMERIC(20,8) DEFAULT 0,
     tp1_triggered   BOOLEAN DEFAULT FALSE,
+    tp2_done        BOOLEAN DEFAULT FALSE,
     status          VARCHAR(16) DEFAULT 'open' CHECK (status IN ('open','closed','partial')),
     opened_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     closed_at       TIMESTAMPTZ

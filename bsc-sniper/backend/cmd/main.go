@@ -195,7 +195,7 @@ func (b *Bot) EmergencyStop(ctx context.Context) error {
 	} else {
 		// Sell sequentially to avoid nonce collisions from parallel tx submission.
 		for _, pos := range positions {
-			if err := b.executor.ExecuteSell(sellCtx, pos, 100); err != nil {
+			if err := b.executor.ExecuteSell(sellCtx, pos, 100, "force"); err != nil {
 				b.logger.Error("emergency sell failed",
 					zap.String("token", pos.TokenAddress),
 					zap.String("symbol", pos.TokenSymbol),

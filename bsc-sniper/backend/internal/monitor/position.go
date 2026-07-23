@@ -32,7 +32,7 @@ const (
 
 // Seller is a subset of the executor used by monitor to trigger sells.
 type Seller interface {
-	ExecuteSell(ctx context.Context, pos *db.Position, pct int) error
+	ExecuteSell(ctx context.Context, pos *db.Position, pct int, sellType string) error
 }
 
 type positionState struct {
@@ -40,6 +40,7 @@ type positionState struct {
 	entryPrice float64
 	athPrice   float64
 	tp1Hit     bool
+	tp2Done    bool
 	openedAt   time.Time
 }
 
@@ -95,6 +96,7 @@ func (m *Monitor) LoadFromDB(ctx context.Context) error {
 			entryPrice: entry,
 			athPrice:   ath,
 			tp1Hit:     p.TP1Triggered,
+			tp2Done:    p.TP2Done,
 			openedAt:   p.OpenedAt,
 		}
 	}
@@ -111,6 +113,7 @@ func (m *Monitor) AddPosition(pos *db.Position) {
 		entryPrice: entry,
 		athPrice:   entry,
 		tp1Hit:     false,
+		tp2Done:    false,
 		openedAt:   pos.OpenedAt,
 	}
 }
@@ -161,6 +164,7 @@ func (m *Monitor) reloadNewPositions(ctx context.Context) {
 			entryPrice: entry,
 			athPrice:   ath,
 			tp1Hit:     p.TP1Triggered,
+			tp2Done:    p.TP2Done,
 			openedAt:   p.OpenedAt,
 		}
 		added++
@@ -181,6 +185,7 @@ func (m *Monitor) persistAllPositions() {
 		pos := state.pos
 		pos.ATHPriceBNB = bigFloatStr(state.athPrice)
 		pos.TP1Triggered = state.tp1Hit
+		pos.TP2Done = state.tp2Done
 		if err := m.db.UpsertPosition(ctx, pos); err != nil {
 			m.logger.Error("persist position on shutdown", zap.Error(err), zap.String("token", pos.TokenAddress))
 		}
@@ -238,23 +243,43 @@ func (m *Monitor) tick(ctx context.Context) {
 		}
 		pricePctGain := (price - entryPrice) / entryPrice * 100
 
+		// Update ATH and current price while locked
+		if price > state.athPrice {
+			state.athPrice = price
+		}
+		pos.CurrentPriceBNB = bigFloatStr(price)
+		pos.ATHPriceBNB = bigFloatStr(state.athPrice)
+
 		var action string
 		var sellPct int
 
 		switch {
-		// TP at +200%: price has tripled relative to entry. Sell 100% of the position.
-		case price >= state.entryPrice*3.0:
-			action = "tp_200"
+		// First take-profit: sell 50% at +200% gain (price = 3x entry).
+		case !state.tp1Hit && price >= state.entryPrice*3.0:
+			action = "tp_50"
+			sellPct = 50
+
+		// Second take-profit: sell remaining 50% at +300% gain (price = 4x entry).
+		case state.tp1Hit && !state.tp2Done && price >= state.entryPrice*4.0:
+			action = "tp_300"
 			sellPct = 100
 
-		// Break-even stop-loss: if price drops to or below entry price, dump 100%.
-		case price <= state.entryPrice:
+		// Trailing stop on second half: after TP1, sell remaining 50% if price drops 20% from peak.
+		case state.tp1Hit && !state.tp2Done && price <= state.athPrice*0.8:
+			action = "trailing_sl"
+			sellPct = 100
+
+		// Break-even stop-loss: if price drops to or below entry price before any TP, dump 100%.
+		case !state.tp1Hit && price <= state.entryPrice:
 			action = "breakeven_sl"
+			sellPct = 100
+
+		// Break-even stop-loss after TP1: sell the remaining 50% if price drops to entry.
+		case state.tp1Hit && !state.tp2Done && price <= state.entryPrice:
+			action = "breakeven_sl_partial"
 			sellPct = 100
 		}
 
-		pos.CurrentPriceBNB = bigFloatStr(price)
-		pos.ATHPriceBNB = bigFloatStr(state.athPrice)
 		m.mu.Unlock()
 
 		// Persist price update
@@ -276,10 +301,16 @@ func (m *Monitor) tick(ctx context.Context) {
 
 		var msg string
 		switch action {
-		case "tp_200":
-			msg = "TP 200% hit, sold all"
+		case "tp_50":
+			msg = "TP 200% hit, sold 50%"
+		case "tp_300":
+			msg = "TP 300% hit, sold remaining 50%"
+		case "trailing_sl":
+			msg = "Trailing stop hit, sold remaining 50%"
 		case "breakeven_sl":
 			msg = "Break-even SL triggered, sold all"
+		case "breakeven_sl_partial":
+			msg = "Break-even SL after TP1, sold remaining 50%"
 		}
 		m.logger.Info(msg,
 			zap.String("action", action),
@@ -289,17 +320,27 @@ func (m *Monitor) tick(ctx context.Context) {
 			zap.Float64("pnl_pct", pricePctGain),
 		)
 
-		sellErr := m.seller.ExecuteSell(ctx, pos, sellPct)
+		sellErr := m.seller.ExecuteSell(ctx, pos, sellPct, action)
 		if sellErr != nil {
 			m.logger.Error("sell failed", zap.Error(sellErr), zap.String("token", tokenAddr))
 			continue
 		}
 
 		m.mu.Lock()
-		pos.Status = "closed"
-		now := time.Now()
-		pos.ClosedAt = &now
-		delete(m.positions, tokenAddr)
+		state, ok = m.positions[tokenAddr]
+		if ok {
+			if action == "tp_50" {
+				state.tp1Hit = true
+				pos.Status = "partial"
+				// Keep monitoring the remaining 50%.
+			} else {
+				state.tp2Done = true
+				pos.Status = "closed"
+				now := time.Now()
+				pos.ClosedAt = &now
+				delete(m.positions, tokenAddr)
+			}
+		}
 		m.mu.Unlock()
 		_ = m.db.UpsertPosition(ctx, pos)
 	}
@@ -454,7 +495,7 @@ func (m *Monitor) SellAllPositions(ctx context.Context) {
 		}
 		pos := state.pos
 
-		if err := m.seller.ExecuteSell(ctx, pos, 100); err != nil {
+		if err := m.seller.ExecuteSell(ctx, pos, 100, "force"); err != nil {
 			m.logger.Error("force sell failed", zap.Error(err), zap.String("token", tokenAddr))
 			continue
 		}
