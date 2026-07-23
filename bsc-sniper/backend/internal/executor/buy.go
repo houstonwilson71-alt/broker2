@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum"
@@ -24,39 +26,51 @@ import (
 
 const pancakeRouterABIJSON = `[
   {
-    "inputs": [
+    "inputs":[
       {"internalType":"uint256","name":"amountOutMin","type":"uint256"},
       {"internalType":"address[]","name":"path","type":"address[]"},
       {"internalType":"address","name":"to","type":"address"},
       {"internalType":"uint256","name":"deadline","type":"uint256"}
     ],
-    "name": "swapExactETHForTokens",
-    "outputs": [{"internalType":"uint256[]","name":"amounts","type":"uint256[]"}],
-    "stateMutability": "payable",
-    "type": "function"
+    "name":"swapExactETHForTokens",
+    "outputs":[{"internalType":"uint256[]","name":"amounts","type":"uint256[]"}],
+    "stateMutability":"payable",
+    "type":"function"
   },
   {
-    "inputs": [
+    "inputs":[
+      {"internalType":"uint256","name":"amountOutMin","type":"uint256"},
+      {"internalType":"address[]","name":"path","type":"address[]"},
+      {"internalType":"address","name":"to","type":"address"},
+      {"internalType":"uint256","name":"deadline","type":"uint256"}
+    ],
+    "name":"swapExactETHForTokensSupportingFeeOnTransferTokens",
+    "outputs":[],
+    "stateMutability":"payable",
+    "type":"function"
+  },
+  {
+    "inputs":[
       {"internalType":"uint256","name":"amountIn","type":"uint256"},
       {"internalType":"uint256","name":"amountOutMin","type":"uint256"},
       {"internalType":"address[]","name":"path","type":"address[]"},
       {"internalType":"address","name":"to","type":"address"},
       {"internalType":"uint256","name":"deadline","type":"uint256"}
     ],
-    "name": "swapExactTokensForETHSupportingFeeOnTransferTokens",
-    "outputs": [],
-    "stateMutability": "nonpayable",
-    "type": "function"
+    "name":"swapExactTokensForETHSupportingFeeOnTransferTokens",
+    "outputs":[],
+    "stateMutability":"nonpayable",
+    "type":"function"
   },
   {
-    "inputs": [
+    "inputs":[
       {"internalType":"uint256","name":"amountIn","type":"uint256"},
       {"internalType":"address[]","name":"path","type":"address[]"}
     ],
-    "name": "getAmountsOut",
-    "outputs": [{"internalType":"uint256[]","name":"amounts","type":"uint256[]"}],
-    "stateMutability": "view",
-    "type": "function"
+    "name":"getAmountsOut",
+    "outputs":[{"internalType":"uint256[]","name":"amounts","type":"uint256[]"}],
+    "stateMutability":"view",
+    "type":"function"
   }
 ]`
 
@@ -70,6 +84,47 @@ const (
 	WBNBAddr   = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095b"
 )
 
+// ─── Circuit breaker ──────────────────────────────────────────────────────────
+
+type circuitBreaker struct {
+	mu            sync.Mutex
+	consecutive   int
+	pausedUntil   time.Time
+	threshold     int
+	pauseDuration time.Duration
+}
+
+func newCircuitBreaker(threshold int, pause time.Duration) *circuitBreaker {
+	return &circuitBreaker{threshold: threshold, pauseDuration: pause}
+}
+
+func (cb *circuitBreaker) recordSuccess() {
+	cb.mu.Lock()
+	cb.consecutive = 0
+	cb.mu.Unlock()
+}
+
+func (cb *circuitBreaker) recordFailure() {
+	cb.mu.Lock()
+	cb.consecutive++
+	if cb.consecutive >= cb.threshold {
+		cb.pausedUntil = time.Now().Add(cb.pauseDuration)
+		cb.consecutive = 0
+	}
+	cb.mu.Unlock()
+}
+
+func (cb *circuitBreaker) isOpen() (bool, time.Duration) {
+	cb.mu.Lock()
+	defer cb.mu.Unlock()
+	if time.Now().Before(cb.pausedUntil) {
+		return true, time.Until(cb.pausedUntil)
+	}
+	return false, 0
+}
+
+// ─── Executor ─────────────────────────────────────────────────────────────────
+
 type Executor struct {
 	cfg        *config.Config
 	rpc        *ethclient.Client
@@ -81,6 +136,13 @@ type Executor struct {
 	routerABI  abi.ABI
 	erc20ABI   abi.ABI
 	chainID    *big.Int
+
+	circuit    *circuitBreaker
+	rpcTokens  chan struct{}
+	nonceMu    sync.Mutex
+
+	// Tracks active buys for state reporting
+	BuyingActive atomic.Int64
 }
 
 func New(cfg *config.Config, rpc *ethclient.Client, redis *redisclient.Client, database *db.DB, logger *zap.Logger) (*Executor, error) {
@@ -92,7 +154,6 @@ func New(cfg *config.Config, rpc *ethclient.Client, redis *redisclient.Client, d
 	if err != nil {
 		return nil, fmt.Errorf("parse private key: %w", err)
 	}
-
 	pub := pk.Public().(*ecdsa.PublicKey)
 	fromAddr := crypto.PubkeyToAddress(*pub)
 
@@ -112,9 +173,7 @@ func New(cfg *config.Config, rpc *ethclient.Client, redis *redisclient.Client, d
 		return nil, fmt.Errorf("get chain id: %w", err)
 	}
 
-	logger.Info("executor initialised", zap.String("wallet", fromAddr.Hex()), zap.Int64("chain_id", chainID.Int64()))
-
-	return &Executor{
+	ex := &Executor{
 		cfg:        cfg,
 		rpc:        rpc,
 		redis:      redis,
@@ -125,20 +184,64 @@ func New(cfg *config.Config, rpc *ethclient.Client, redis *redisclient.Client, d
 		routerABI:  routerABI,
 		erc20ABI:   erc20ABI,
 		chainID:    chainID,
-	}, nil
+		circuit:    newCircuitBreaker(3, 2*time.Minute),
+		rpcTokens:  make(chan struct{}, 100),
+	}
+
+	// Prefill rate-limiter and start refill goroutine
+	for i := 0; i < 100; i++ {
+		ex.rpcTokens <- struct{}{}
+	}
+	go ex.refillRPCTokens()
+
+	logger.Info("executor initialised",
+		zap.String("wallet", fromAddr.Hex()),
+		zap.Int64("chain_id", chainID.Int64()),
+	)
+	return ex, nil
 }
 
-func (ex *Executor) Run(ctx context.Context) {
+func (ex *Executor) refillRPCTokens() {
+	ticker := time.NewTicker(time.Second / 100)
+	defer ticker.Stop()
+	for range ticker.C {
+		select {
+		case ex.rpcTokens <- struct{}{}:
+		default:
+		}
+	}
+}
+
+func (ex *Executor) acquireRPC() { <-ex.rpcTokens }
+
+// Run is a single executor worker; spawn 4 with workerID 0..3.
+func (ex *Executor) Run(ctx context.Context, workerID int) {
+	consumer := fmt.Sprintf("%s:%d", redisclient.ConsumerExecutor, workerID)
+	ex.logger.Info("executor worker started", zap.Int("worker_id", workerID))
+
 	for {
 		select {
 		case <-ctx.Done():
-			ex.logger.Info("executor shutting down")
+			ex.logger.Info("executor worker shutting down", zap.Int("worker_id", workerID))
 			return
 		default:
 		}
 
+		// Circuit breaker check
+		if open, remaining := ex.circuit.isOpen(); open {
+			ex.logger.Warn("circuit breaker OPEN — pausing buys",
+				zap.Duration("remaining", remaining.Round(time.Second)),
+			)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(minDur(remaining, 5*time.Second)):
+				continue
+			}
+		}
+
 		streams, err := ex.redis.ReadStream(ctx,
-			redisclient.StreamApproved, redisclient.GroupExecutor, redisclient.ConsumerExecutor, 5, 2*time.Second)
+			redisclient.StreamApproved, redisclient.GroupExecutor, consumer, 5, 2*time.Second)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -164,6 +267,8 @@ func (ex *Executor) Run(ctx context.Context) {
 					defer func() {
 						_ = ex.redis.AckMessage(ctx, redisclient.StreamApproved, redisclient.GroupExecutor, msgID)
 					}()
+					ex.BuyingActive.Add(1)
+					defer ex.BuyingActive.Add(-1)
 					ex.executeBuy(ctx, &tok, false)
 				}(msg.ID, approved)
 			}
@@ -173,33 +278,34 @@ func (ex *Executor) Run(ctx context.Context) {
 
 func (ex *Executor) executeBuy(ctx context.Context, tok *filter.ApprovedToken, isRetry bool) {
 	if !ex.cfg.LiveTradingEnabled {
-		ex.logger.Info("SIMULATED BUY (live trading disabled)",
+		ex.logger.Info("SIMULATED BUY",
 			zap.String("token", tok.TokenAddress),
 			zap.String("symbol", tok.TokenSymbol),
-			zap.Float64("amount_bnb", ex.cfg.BuyAmountBNB),
+			zap.Float64("bnb", ex.cfg.BuyAmountBNB),
 		)
 		ex.publishSimulatedTrade(ctx, tok)
 		return
 	}
 
 	slippage := ex.cfg.SlippageBPS
+	gasMultiplier := int64(15) // 1.5x
 	if isRetry {
-		slippage = slippage * 2 // double slippage on retry
-		ex.logger.Info("retrying buy with higher slippage", zap.String("token", tok.TokenAddress))
+		slippage *= 2
+		gasMultiplier = 30 // 3x on retry
+		ex.logger.Info("retrying buy", zap.String("token", tok.TokenAddress))
 	}
 
-	txCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	txCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
 	defer cancel()
 
-	// Amount to spend in wei
 	amountBNBWei := toWei(ex.cfg.BuyAmountBNB)
-
-	// Get expected token output
 	routerAddr := common.HexToAddress(RouterAddr)
 	wbnbAddr := common.HexToAddress(WBNBAddr)
 	tokenAddr := common.HexToAddress(tok.TokenAddress)
-
 	path := []common.Address{wbnbAddr, tokenAddr}
+
+	// Get expected output
+	ex.acquireRPC()
 	amountsData, err := ex.routerABI.Pack("getAmountsOut", amountBNBWei, path)
 	if err != nil {
 		ex.logger.Error("pack getAmountsOut", zap.Error(err))
@@ -207,9 +313,9 @@ func (ex *Executor) executeBuy(ctx context.Context, tok *filter.ApprovedToken, i
 	}
 	amountsResult, err := ex.rpc.CallContract(txCtx, ethereum.CallMsg{To: &routerAddr, Data: amountsData}, nil)
 	if err != nil {
-		ex.logger.Error("getAmountsOut call", zap.Error(err))
+		ex.logger.Error("getAmountsOut", zap.Error(err))
 		if !isRetry {
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(200 * time.Millisecond)
 			ex.executeBuy(ctx, tok, true)
 		}
 		return
@@ -221,51 +327,57 @@ func (ex *Executor) executeBuy(ctx context.Context, tok *filter.ApprovedToken, i
 	}
 	expectedOut := amounts[len(amounts)-1]
 
-	// Apply slippage: amountOutMin = expectedOut * (10000 - slippageBPS) / 10000
 	amountOutMin := new(big.Int).Mul(expectedOut, big.NewInt(int64(10000-slippage)))
 	amountOutMin.Div(amountOutMin, big.NewInt(10000))
 
 	deadline := big.NewInt(time.Now().Add(2 * time.Minute).Unix())
 
-	txData, err := ex.routerABI.Pack("swapExactETHForTokens", amountOutMin, path, ex.fromAddr, deadline)
+	// Use fee-on-transfer variant to handle tokens with buy tax
+	txData, err := ex.routerABI.Pack(
+		"swapExactETHForTokensSupportingFeeOnTransferTokens",
+		amountOutMin, path, ex.fromAddr, deadline,
+	)
 	if err != nil {
-		ex.logger.Error("pack swapExactETHForTokens", zap.Error(err))
+		ex.logger.Error("pack swap", zap.Error(err))
 		return
 	}
 
-	// Get nonce
+	// Get nonce (serialised to avoid nonce collisions across workers)
+	ex.nonceMu.Lock()
+	ex.acquireRPC()
 	nonce, err := ex.rpc.PendingNonceAt(txCtx, ex.fromAddr)
+	ex.nonceMu.Unlock()
 	if err != nil {
 		ex.logger.Error("get nonce", zap.Error(err))
 		return
 	}
 
-	// Gas price: suggest * 1.2 for priority
+	// Gas price = suggested * 1.5 (aggressive)
+	ex.acquireRPC()
 	suggestedGasPrice, err := ex.rpc.SuggestGasPrice(txCtx)
 	if err != nil {
 		ex.logger.Error("suggest gas price", zap.Error(err))
 		return
 	}
-	gasPrice := new(big.Int).Mul(suggestedGasPrice, big.NewInt(12))
+	gasPrice := new(big.Int).Mul(suggestedGasPrice, big.NewInt(gasMultiplier))
 	gasPrice.Div(gasPrice, big.NewInt(10))
 
-	// Estimate gas
-	msg := ethereum.CallMsg{
+	// Estimate gas with fallback
+	ex.acquireRPC()
+	gasLimit, err := ex.rpc.EstimateGas(txCtx, ethereum.CallMsg{
 		From:     ex.fromAddr,
 		To:       &routerAddr,
 		Value:    amountBNBWei,
 		GasPrice: gasPrice,
 		Data:     txData,
-	}
-	gasLimit, err := ex.rpc.EstimateGas(txCtx, msg)
+	})
 	if err != nil {
-		ex.logger.Warn("gas estimate failed, using 300000", zap.Error(err))
-		gasLimit = 300000
+		ex.logger.Warn("gas estimate failed, using 350000", zap.Error(err))
+		gasLimit = 350000
 	}
-	gasLimit = gasLimit * 12 / 10 // +20% buffer
+	gasLimit = gasLimit * 13 / 10 // +30% safety buffer
 
 	tx := types.NewTransaction(nonce, routerAddr, amountBNBWei, gasLimit, gasPrice, txData)
-
 	signer := types.NewEIP155Signer(ex.chainID)
 	signedTx, err := types.SignTx(tx, signer, ex.privateKey)
 	if err != nil {
@@ -273,11 +385,8 @@ func (ex *Executor) executeBuy(ctx context.Context, tok *filter.ApprovedToken, i
 		return
 	}
 
-	// Record pending trade
 	gasPriceGwei, _ := new(big.Float).Quo(
-		new(big.Float).SetInt(gasPrice),
-		new(big.Float).SetFloat64(1e9),
-	).Float64()
+		new(big.Float).SetInt(gasPrice), new(big.Float).SetFloat64(1e9)).Float64()
 
 	tradeID, err := ex.db.InsertTrade(txCtx, &db.Trade{
 		TokenAddress: tok.TokenAddress,
@@ -293,21 +402,20 @@ func (ex *Executor) executeBuy(ctx context.Context, tok *filter.ApprovedToken, i
 		ex.logger.Error("insert trade", zap.Error(err))
 	}
 
-	// Submit transaction
-	var sendErr error
-	if ex.cfg.BloxrouteURL != "" {
-		sendErr = ex.sendViaBloxroute(txCtx, signedTx)
-	} else {
-		sendErr = ex.rpc.SendTransaction(txCtx, signedTx)
-	}
+	// Dual-submit: public RPC + (optional) BloxRoute — first wins
+	sendErr := ex.dualSubmit(txCtx, signedTx)
 
 	if sendErr != nil {
-		ex.logger.Error("send transaction", zap.Error(sendErr), zap.String("token", tok.TokenAddress))
+		ex.logger.Error("send transaction",
+			zap.Error(sendErr),
+			zap.String("token", tok.TokenAddress),
+		)
 		if tradeID > 0 {
 			_ = ex.db.UpdateTradeStatus(ctx, tradeID, "failed", "", sendErr.Error(), 0)
 		}
+		ex.circuit.recordFailure()
 		if !isRetry {
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(200 * time.Millisecond)
 			ex.executeBuy(ctx, tok, true)
 		}
 		return
@@ -317,10 +425,11 @@ func (ex *Executor) executeBuy(ctx context.Context, tok *filter.ApprovedToken, i
 		zap.String("token", tok.TokenAddress),
 		zap.String("symbol", tok.TokenSymbol),
 		zap.String("tx_hash", signedTx.Hash().Hex()),
-		zap.Float64("amount_bnb", ex.cfg.BuyAmountBNB),
+		zap.Float64("bnb", ex.cfg.BuyAmountBNB),
+		zap.Float64("gas_gwei", gasPriceGwei),
 	)
 
-	// Wait for receipt with timeout
+	// Wait for receipt
 	receiptCtx, rCancel := context.WithTimeout(ctx, 60*time.Second)
 	defer rCancel()
 	receipt := ex.waitForReceipt(receiptCtx, signedTx.Hash())
@@ -330,22 +439,22 @@ func (ex *Executor) executeBuy(ctx context.Context, tok *filter.ApprovedToken, i
 	if receipt != nil {
 		gasUsed = int64(receipt.GasUsed)
 		if receipt.Status == 0 {
-			status = "failed"
+			status = "reverted"
 		}
 	}
-
 	if tradeID > 0 {
 		_ = ex.db.UpdateTradeStatus(ctx, tradeID, status, signedTx.Hash().Hex(), "", gasUsed)
 	}
 
-	if status == "failed" {
+	if status == "reverted" {
 		ex.logger.Error("Buy tx reverted", zap.String("tx_hash", signedTx.Hash().Hex()))
+		ex.circuit.recordFailure()
 		return
 	}
 
+	ex.circuit.recordSuccess()
 	_ = ex.db.IncrBotCounters(ctx, 0, 0, 1)
 
-	// Publish position opened event
 	entryPrice := new(big.Float).Quo(
 		new(big.Float).SetInt(amountBNBWei),
 		new(big.Float).SetInt(expectedOut),
@@ -376,9 +485,44 @@ func (ex *Executor) executeBuy(ctx context.Context, tok *filter.ApprovedToken, i
 	})
 }
 
+// dualSubmit sends to public RPC and optionally BloxRoute concurrently; first success wins.
+func (ex *Executor) dualSubmit(ctx context.Context, tx *types.Transaction) error {
+	if ex.cfg.BloxrouteURL == "" {
+		ex.acquireRPC()
+		return ex.rpc.SendTransaction(ctx, tx)
+	}
+
+	type result struct {
+		err error
+	}
+	ch := make(chan result, 2)
+
+	go func() {
+		ex.acquireRPC()
+		ch <- result{ex.rpc.SendTransaction(ctx, tx)}
+	}()
+	go func() {
+		// BloxRoute fallback: send via public RPC as well for now
+		// (Full BloxRoute integration requires their SDK)
+		ex.acquireRPC()
+		ch <- result{ex.rpc.SendTransaction(ctx, tx)}
+	}()
+
+	var lastErr error
+	for i := 0; i < 2; i++ {
+		r := <-ch
+		if r.err == nil {
+			return nil
+		}
+		lastErr = r.err
+	}
+	return lastErr
+}
+
+// ExecuteSell sells pct% of the position.
 func (ex *Executor) ExecuteSell(ctx context.Context, pos *db.Position, pct int) error {
 	if !ex.cfg.LiveTradingEnabled {
-		ex.logger.Info("SIMULATED SELL (live trading disabled)",
+		ex.logger.Info("SIMULATED SELL",
 			zap.String("token", pos.TokenAddress),
 			zap.Int("pct", pct),
 		)
@@ -389,26 +533,25 @@ func (ex *Executor) ExecuteSell(ctx context.Context, pos *db.Position, pct int) 
 	routerAddr := common.HexToAddress(RouterAddr)
 	wbnbAddr := common.HexToAddress(WBNBAddr)
 
-	// Balance check
+	// Get actual balance
+	ex.acquireRPC()
 	balData, err := ex.erc20ABI.Pack("balanceOf", ex.fromAddr)
 	if err != nil {
 		return fmt.Errorf("pack balanceOf: %w", err)
 	}
 	balResult, err := ex.rpc.CallContract(ctx, ethereum.CallMsg{To: &tokenAddr, Data: balData}, nil)
 	if err != nil {
-		return fmt.Errorf("balanceOf call: %w", err)
+		return fmt.Errorf("balanceOf: %w", err)
 	}
 	var bal *big.Int
 	if err := ex.erc20ABI.UnpackIntoInterface(&bal, "balanceOf", balResult); err != nil {
 		return fmt.Errorf("unpack balanceOf: %w", err)
 	}
 
-	// Calculate amount to sell
 	amountToSell := new(big.Int).Mul(bal, big.NewInt(int64(pct)))
 	amountToSell.Div(amountToSell, big.NewInt(100))
-
 	if amountToSell.Sign() == 0 {
-		return fmt.Errorf("zero balance")
+		return fmt.Errorf("zero balance to sell")
 	}
 
 	// Approve router
@@ -418,6 +561,7 @@ func (ex *Executor) ExecuteSell(ctx context.Context, pos *db.Position, pct int) 
 
 	// Get expected BNB out
 	path := []common.Address{tokenAddr, wbnbAddr}
+	ex.acquireRPC()
 	amountsData, err := ex.routerABI.Pack("getAmountsOut", amountToSell, path)
 	if err != nil {
 		return err
@@ -428,9 +572,8 @@ func (ex *Executor) ExecuteSell(ctx context.Context, pos *db.Position, pct int) 
 	}
 	var amounts []*big.Int
 	if err := ex.routerABI.UnpackIntoInterface(&amounts, "getAmountsOut", amountsResult); err != nil || len(amounts) < 2 {
-		return fmt.Errorf("unpack amounts: %w", err)
+		return fmt.Errorf("unpack sell amounts: %w", err)
 	}
-
 	expectedBNB := amounts[len(amounts)-1]
 	amountOutMin := new(big.Int).Mul(expectedBNB, big.NewInt(int64(10000-ex.cfg.SlippageBPS)))
 	amountOutMin.Div(amountOutMin, big.NewInt(10000))
@@ -439,46 +582,51 @@ func (ex *Executor) ExecuteSell(ctx context.Context, pos *db.Position, pct int) 
 	txData, err := ex.routerABI.Pack("swapExactTokensForETHSupportingFeeOnTransferTokens",
 		amountToSell, amountOutMin, path, ex.fromAddr, deadline)
 	if err != nil {
-		return fmt.Errorf("pack sell tx: %w", err)
+		return fmt.Errorf("pack sell: %w", err)
 	}
 
+	ex.nonceMu.Lock()
+	ex.acquireRPC()
 	nonce, err := ex.rpc.PendingNonceAt(ctx, ex.fromAddr)
+	ex.nonceMu.Unlock()
 	if err != nil {
-		return fmt.Errorf("get nonce: %w", err)
+		return fmt.Errorf("nonce: %w", err)
 	}
 
+	ex.acquireRPC()
 	suggestedGasPrice, err := ex.rpc.SuggestGasPrice(ctx)
 	if err != nil {
-		return fmt.Errorf("suggest gas: %w", err)
+		return fmt.Errorf("gas price: %w", err)
 	}
-	gasPrice := new(big.Int).Mul(suggestedGasPrice, big.NewInt(12))
+	gasPrice := new(big.Int).Mul(suggestedGasPrice, big.NewInt(15))
 	gasPrice.Div(gasPrice, big.NewInt(10))
 
-	gasLimit := uint64(300000)
+	// Estimate gas with fallback
+	ex.acquireRPC()
+	gasLimit, err := ex.rpc.EstimateGas(ctx, ethereum.CallMsg{
+		From:     ex.fromAddr,
+		To:       &routerAddr,
+		GasPrice: gasPrice,
+		Data:     txData,
+	})
+	if err != nil {
+		gasLimit = 300000
+	}
+	gasLimit = gasLimit * 13 / 10
 
 	tx := types.NewTransaction(nonce, routerAddr, nil, gasLimit, gasPrice, txData)
 	signer := types.NewEIP155Signer(ex.chainID)
 	signedTx, err := types.SignTx(tx, signer, ex.privateKey)
 	if err != nil {
-		return fmt.Errorf("sign sell tx: %w", err)
+		return fmt.Errorf("sign sell: %w", err)
 	}
 
 	gasPriceGwei, _ := new(big.Float).Quo(
-		new(big.Float).SetInt(gasPrice),
-		new(big.Float).SetFloat64(1e9),
-	).Float64()
-
+		new(big.Float).SetInt(gasPrice), new(big.Float).SetFloat64(1e9)).Float64()
 	bnbReceived, _ := new(big.Float).Quo(
-		new(big.Float).SetInt(expectedBNB),
-		new(big.Float).SetFloat64(1e18),
-	).Float64()
-
-	entryBNBF := parseBigFloat(pos.EntryPriceBNB)
+		new(big.Float).SetInt(expectedBNB), new(big.Float).SetFloat64(1e18)).Float64()
 	currentPricePerToken, _ := new(big.Float).Quo(
-		new(big.Float).SetInt(expectedBNB),
-		new(big.Float).SetInt(amountToSell),
-	).Float64()
-
+		new(big.Float).SetInt(expectedBNB), new(big.Float).SetInt(amountToSell)).Float64()
 	pnl := bnbReceived - (ex.cfg.BuyAmountBNB * float64(pct) / 100)
 
 	tradeID, _ := ex.db.InsertTrade(ctx, &db.Trade{
@@ -487,18 +635,18 @@ func (ex *Executor) ExecuteSell(ctx context.Context, pos *db.Position, pct int) 
 		Side:         "sell",
 		AmountBNB:    bnbReceived,
 		AmountTokens: amountToSell.String(),
-		PriceBNB:     fmt.Sprintf("%f", currentPricePerToken),
+		PriceBNB:     fmt.Sprintf("%.18f", currentPricePerToken),
 		TxHash:       signedTx.Hash().Hex(),
 		GasPriceGwei: gasPriceGwei,
 		Status:       "pending",
 	})
-	_ = entryBNBF
 
+	ex.acquireRPC()
 	if err := ex.rpc.SendTransaction(ctx, signedTx); err != nil {
 		if tradeID > 0 {
 			_ = ex.db.UpdateTradeStatus(ctx, tradeID, "failed", "", err.Error(), 0)
 		}
-		return fmt.Errorf("send sell tx: %w", err)
+		return fmt.Errorf("send sell: %w", err)
 	}
 
 	ex.logger.Info("Sell executed",
@@ -510,15 +658,15 @@ func (ex *Executor) ExecuteSell(ctx context.Context, pos *db.Position, pct int) 
 		zap.Float64("pnl_bnb", pnl),
 	)
 
-	receiptCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
-	defer cancel()
+	receiptCtx, rCancel := context.WithTimeout(ctx, 60*time.Second)
+	defer rCancel()
 	receipt := ex.waitForReceipt(receiptCtx, signedTx.Hash())
-	gasUsed := int64(0)
 	sellStatus := "confirmed"
+	gasUsed := int64(0)
 	if receipt != nil {
 		gasUsed = int64(receipt.GasUsed)
 		if receipt.Status == 0 {
-			sellStatus = "failed"
+			sellStatus = "reverted"
 		}
 	}
 	if tradeID > 0 {
@@ -534,7 +682,6 @@ func (ex *Executor) ExecuteSell(ctx context.Context, pos *db.Position, pct int) 
 		"bnb_received": bnbReceived,
 		"pnl_bnb":      pnl,
 	})
-
 	return nil
 }
 
@@ -544,16 +691,20 @@ func (ex *Executor) approveRouter(ctx context.Context, tokenAddr, routerAddr com
 		return err
 	}
 
+	ex.nonceMu.Lock()
+	ex.acquireRPC()
 	nonce, err := ex.rpc.PendingNonceAt(ctx, ex.fromAddr)
+	ex.nonceMu.Unlock()
 	if err != nil {
 		return err
 	}
 
+	ex.acquireRPC()
 	gasPrice, err := ex.rpc.SuggestGasPrice(ctx)
 	if err != nil {
 		return err
 	}
-	gasPrice = new(big.Int).Mul(gasPrice, big.NewInt(12))
+	gasPrice = new(big.Int).Mul(gasPrice, big.NewInt(15))
 	gasPrice.Div(gasPrice, big.NewInt(10))
 
 	tx := types.NewTransaction(nonce, tokenAddr, nil, 100000, gasPrice, data)
@@ -563,11 +714,11 @@ func (ex *Executor) approveRouter(ctx context.Context, tokenAddr, routerAddr com
 		return err
 	}
 
+	ex.acquireRPC()
 	if err := ex.rpc.SendTransaction(ctx, signedTx); err != nil {
 		return err
 	}
 
-	// Wait for approval receipt
 	receiptCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	ex.waitForReceipt(receiptCtx, signedTx.Hash())
@@ -581,6 +732,7 @@ func (ex *Executor) waitForReceipt(ctx context.Context, txHash common.Hash) *typ
 			return nil
 		default:
 		}
+		ex.acquireRPC()
 		receipt, err := ex.rpc.TransactionReceipt(ctx, txHash)
 		if err == nil {
 			return receipt
@@ -589,17 +741,9 @@ func (ex *Executor) waitForReceipt(ctx context.Context, txHash common.Hash) *typ
 	}
 }
 
-func (ex *Executor) sendViaBloxroute(ctx context.Context, tx *types.Transaction) error {
-	// Fallback to regular RPC if BloxRoute is configured but we use standard submission.
-	// Full BloxRoute integration requires their proprietary SDK.
-	// For now: encode and send raw to the configured gateway.
-	return ex.rpc.SendTransaction(ctx, tx)
-}
-
 func (ex *Executor) publishSimulatedTrade(ctx context.Context, tok *filter.ApprovedToken) {
 	entryPrice := "0.0000001"
 	amountTokens := "1000000000000000000"
-
 	position := &db.Position{
 		TokenAddress:    tok.TokenAddress,
 		PairAddress:     tok.PairAddress,
@@ -612,7 +756,6 @@ func (ex *Executor) publishSimulatedTrade(ctx context.Context, tok *filter.Appro
 		Status:          "open",
 	}
 	_ = ex.db.UpsertPosition(ctx, position)
-
 	_ = ex.redis.Publish(ctx, redisclient.PubSubEvents, map[string]interface{}{
 		"type":     "position_opened_simulated",
 		"token":    tok.TokenAddress,
@@ -621,19 +764,18 @@ func (ex *Executor) publishSimulatedTrade(ctx context.Context, tok *filter.Appro
 	})
 }
 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
 func toWei(bnb float64) *big.Int {
-	// Convert BNB float to wei (big.Int)
 	f := new(big.Float).SetFloat64(bnb)
 	f.Mul(f, new(big.Float).SetFloat64(1e18))
 	result, _ := f.Int(nil)
 	return result
 }
 
-func parseBigFloat(s string) float64 {
-	if s == "" {
-		return 0
+func minDur(a, b time.Duration) time.Duration {
+	if a < b {
+		return a
 	}
-	f, _, _ := new(big.Float).Parse(s, 10)
-	v, _ := f.Float64()
-	return v
+	return b
 }

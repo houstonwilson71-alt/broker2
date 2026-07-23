@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 	"sync/atomic"
@@ -25,14 +26,16 @@ type BotController interface {
 	Start() error
 	Stop() error
 	IsRunning() bool
+	EmergencyStop(ctx context.Context) error
+	State() string // "idle" | "scanning" | "buying" | "selling"
 }
 
 type Server struct {
-	cfg    *config.Config
-	db     *db.DB
-	redis  *redisclient.Client
-	bot    BotController
-	logger *zap.Logger
+	cfg       *config.Config
+	db        *db.DB
+	redis     *redisclient.Client
+	bot       BotController
+	logger    *zap.Logger
 	wsClients atomic.Int64
 }
 
@@ -58,6 +61,7 @@ func (s *Server) Router() *gin.Engine {
 		api.GET("/health", s.health)
 		api.POST("/bot/start", s.botStart)
 		api.POST("/bot/stop", s.botStop)
+		api.POST("/bot/emergency-stop", s.botEmergencyStop)
 		api.GET("/bot/status", s.botStatus)
 		api.GET("/tokens", s.listTokens)
 		api.GET("/trades", s.listTrades)
@@ -77,6 +81,7 @@ func (s *Server) health(c *gin.Context) {
 	resp := gin.H{
 		"status":    "ok",
 		"timestamp": time.Now().UTC(),
+		"state":     s.bot.State(),
 	}
 	if botState != nil {
 		resp["bot_running"] = botState.Running
@@ -114,6 +119,19 @@ func (s *Server) botStop(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "stopped", "timestamp": time.Now().UTC()})
 }
 
+// POST /api/bot/emergency-stop — immediately sells all positions then stops
+func (s *Server) botEmergencyStop(c *gin.Context) {
+	s.logger.Warn("EMERGENCY STOP requested via API")
+	if err := s.bot.EmergencyStop(c.Request.Context()); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"status":    "emergency_stopped",
+		"timestamp": time.Now().UTC(),
+	})
+}
+
 // GET /api/bot/status
 func (s *Server) botStatus(c *gin.Context) {
 	ctx := c.Request.Context()
@@ -123,13 +141,14 @@ func (s *Server) botStatus(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"running":       state.Running,
-		"started_at":    state.StartedAt,
-		"stopped_at":    state.StoppedAt,
-		"pairs_seen":    state.PairsSeen,
-		"pairs_passed":  state.PairsPassed,
-		"trades_total":  state.TradesTotal,
-		"ws_clients":    s.wsClients.Load(),
+		"running":      state.Running,
+		"state":        s.bot.State(),
+		"started_at":   state.StartedAt,
+		"stopped_at":   state.StoppedAt,
+		"pairs_seen":   state.PairsSeen,
+		"pairs_passed": state.PairsPassed,
+		"trades_total": state.TradesTotal,
+		"ws_clients":   s.wsClients.Load(),
 	})
 }
 
@@ -209,7 +228,6 @@ func (s *Server) updateConfig(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-
 	if body.LiveTradingEnabled != nil {
 		s.cfg.LiveTradingEnabled = *body.LiveTradingEnabled
 	}
@@ -237,7 +255,6 @@ func (s *Server) updateConfig(c *gin.Context) {
 	if body.TrailingStopPct != nil {
 		s.cfg.TrailingStopPct = *body.TrailingStopPct
 	}
-
 	s.getConfig(c)
 }
 
@@ -253,17 +270,13 @@ func (s *Server) handleWS(c *gin.Context) {
 	s.wsClients.Add(1)
 	defer s.wsClients.Add(-1)
 
-	ctx, cancel := c.Request.Context(), func() {}
-	_ = cancel
-
+	ctx := c.Request.Context()
 	msgCh, unsub := s.redis.Subscribe(ctx, redisclient.PubSubEvents)
 	defer unsub()
 
-	// Ping ticker
 	pingTicker := time.NewTicker(30 * time.Second)
 	defer pingTicker.Stop()
 
-	// Handle incoming messages (for close/ping from client)
 	go func() {
 		for {
 			if _, _, err := conn.ReadMessage(); err != nil {

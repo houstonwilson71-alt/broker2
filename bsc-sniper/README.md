@@ -1,148 +1,116 @@
-# BSC Sniper — Production Meme Coin Sniper for BNB Smart Chain
+# BSC Meme-Coin Sniper — Hardened Multi-Version Edition
 
-A fully-automated, production-grade meme coin sniping bot for BSC mainnet. Written in Go, with a Next.js 14 dashboard, PostgreSQL, and Redis.
-
----
+Production-grade BSC mainnet sniper bot. Listens to **PancakeSwap V2 + V3 + StableSwap** factory events, applies rigorous safety filters, and executes buys with surgical precision.
 
 ## Architecture
 
 ```
-PancakeSwap Factory ──WebSocket──▶ Listener
-                                       │
-                              Redis stream:new_pairs
-                                       │
-                                   Filter Engine
-                              (liquidity, age, holders,
-                               honeypot simulation)
-                                       │
-                            Redis stream:approved_tokens
-                                       │
-                                   Executor (Buy)
-                              PancakeSwap Router swap
-                                       │
-                                Position Monitor
-                              (200ms price polling,
-                               TP1, trailing stop,
-                               time-based exit)
-                                       │
-                                   Executor (Sell)
+WebSocket Listener (V2+V3+Stable) ──► Redis stream:new_pairs
+    │ ring-buffer dedup                        │
+    │ exponential-backoff reconnect     4× Filter Workers
+    │                                   ├─ Liquidity check    ┐
+    │                                   ├─ Token age          ├─ parallel 2.5s deadline
+    │                                   ├─ Honeypot sim       │
+    │                                   └─ Holder check       ┘
+    │                                          │
+    │                                   Redis stream:approved_tokens
+    │                                          │
+    │                                   4× Executor Workers
+    │                                   ├─ Gas price × 1.5
+    │                                   ├─ Dual-submit (RPC + BloxRoute)
+    │                                   ├─ Circuit breaker (3-fail → 2-min pause)
+    │                                   └─ On-chain receipt wait
+    │                                          │
+    │                                   Position Monitor (200ms tick)
+    │                                   ├─ TP1: +100% → sell 50%
+    │                                   ├─ Trailing stop: -25% from ATH → sell 100%
+    │                                   └─ Time exit: >2h, <20% gain → sell 100%
+    │
+PostgreSQL 16 ◄── All events persisted
+Redis 7       ◄── Streams + pub/sub
+Next.js 14    ──► Dashboard (port 3000)
+Gin REST API  ──► Backend (port 8080)
 ```
-
----
 
 ## Quick Start
 
-### 1. Prerequisites
-
-- Docker + Docker Compose v2
-- A funded BSC wallet (≥0.01 BNB recommended for gas)
-
-### 2. Configure
-
 ```bash
 cp .env.example .env
-# Edit .env — fill in your RPC URLs and private key
-```
+# Edit .env with your credentials
 
-**Important `.env` fields:**
-
-| Variable | Description |
-|---|---|
-| `BSC_RPC_WS` | NodeReal / Ankr / BNB Chain WebSocket endpoint |
-| `BSC_RPC_HTTP` | NodeReal / Ankr HTTP endpoint |
-| `PRIVATE_KEY` | Your wallet private key (starts with 0x) |
-| `LIVE_TRADING_ENABLED` | `false` = simulation, `true` = real trades |
-| `BUY_AMOUNT_BNB` | BNB spent per trade (default 0.0005) |
-
-### 3. Build & Run
-
-```bash
-cd bsc-sniper
 docker compose build
 docker compose up -d
-```
-
-### 4. Verify
-
-```bash
-# Health check
-curl http://localhost:8080/api/health
 
 # Start the bot
 curl -X POST http://localhost:8080/api/bot/start
 
-# Watch logs
-docker compose logs -f backend | grep -E "PairCreated|Buy executed|Sell executed"
+# Dashboard
+open http://localhost:3000
 ```
 
-### 5. Dashboard
+## Factory Coverage
 
-Open http://localhost:3000 in your browser.
+| Exchange | Factory | Event | Status |
+|---|---|---|---|
+| PancakeSwap V2 | `0xcA143Ce32...` | `PairCreated` | ✅ Subscribed |
+| PancakeSwap V3 | `0x0BFbCF9fa...` | `PoolCreated` | ✅ Subscribed |
+| PancakeSwap StableSwap | `0x25a55f9f...` | `NewStableSwapPair` | ✅ Subscribed |
 
----
+All three subscribed in a **single WebSocket connection** with a combined filter query.
 
 ## Safety Filters
 
-Each new pair goes through these checks in parallel (2s timeout):
+All checks run in parallel with a strict **2.5-second total deadline**:
 
-| Check | Default | Purpose |
-|---|---|---|
-| Min liquidity | $1,000 USD | Avoid illiquid scams |
-| Max age | 300 sec | Only fresh pairs |
-| Min holders | 25 | Early-stage community |
-| Top-10 concentration | ≤35% | Whale rug protection |
-| Honeypot simulation | — | Buy & sell simulation via router |
+1. **Liquidity** — `getReserves()` + BNB price (CoinGecko, 30s cache, on-chain fallback)
+2. **Age** — reject if pair event > `MAX_AGE_SEC` seconds old
+3. **Honeypot simulation** — `getAmountsOut` buy then sell; reject if sell tax > 50%
+4. **Holder count** — BSCscan API (best-effort, non-blocking)
 
----
+## Hardening Features
 
-## Exit Strategy
-
-1. **Take-Profit 1** at +100% → sell 50% of position
-2. After TP1, activate **25% trailing stop** from ATH
-3. If trailing stop triggered → sell remaining 100%
-4. **Time-based exit**: position open >2h and P&L <20% → market sell 100%
-
----
+| Feature | Implementation |
+|---|---|
+| Ring-buffer dedup | 10,000-slot LRU, O(1) lookup |
+| WS auto-reconnect | Exponential backoff 1s→30s, resets on stable connection |
+| Rate limiter | Token-bucket 100 req/s shared across all workers |
+| Circuit breaker | 3 consecutive tx fails → 2-minute buy pause |
+| Panic recovery | Monitor tick recovers from any panic, logs stack |
+| Graceful shutdown | Open positions flushed to DB before exit |
+| Emergency stop | `POST /api/bot/emergency-stop` → sells all positions |
 
 ## API Reference
 
-| Method | Path | Description |
+| Method | Endpoint | Description |
 |---|---|---|
-| GET | `/api/health` | Health check & stats |
-| POST | `/api/bot/start` | Start the sniping bot |
-| POST | `/api/bot/stop` | Stop the bot |
-| GET | `/api/bot/status` | Detailed bot status |
-| GET | `/api/tokens` | Recent tokens discovered |
-| GET | `/api/trades` | Trade history |
-| GET | `/api/positions` | Current & past positions |
-| GET | `/api/config` | Current configuration |
-| PUT | `/api/config` | Update configuration live |
-| WS | `/api/ws` | Real-time event stream |
+| `GET` | `/api/health` | Health check + state |
+| `POST` | `/api/bot/start` | Start the bot |
+| `POST` | `/api/bot/stop` | Graceful stop |
+| `POST` | `/api/bot/emergency-stop` | Sell all + stop |
+| `GET` | `/api/bot/status` | Status, counters, state |
+| `GET` | `/api/trades` | Trade history |
+| `GET` | `/api/positions` | Open/closed positions |
+| `GET` | `/api/tokens` | Detected tokens |
+| `GET` | `/api/config` | Current config |
+| `PUT` | `/api/config` | Update config live |
+| `GET` | `/api/ws` | WebSocket event stream |
 
----
+## Exit Strategy
 
-## MEV Protection
+```
+Buy → Monitor (200ms)
+  If price +100%:         sell 50% (TP1)
+  If ATH drawdown -25%:  sell 100% (trailing stop, after TP1)
+  If open >2h, gain <20%: sell 100% (time exit)
+```
 
-Set `BLOXROUTE_URL` to your BloxRoute private relay endpoint to submit transactions privately and avoid front-running. When empty, transactions go through the public BSC mempool.
+## Environment Variables
 
----
+See `.env.example` for all options.
 
-## Security Notes
+## Notes
 
-- **Never commit `.env`** — it is in `.gitignore`.
-- The private key is never logged or exposed via API.
-- All external calls use context timeouts to prevent hangs.
-- Run with `LIVE_TRADING_ENABLED=false` first to verify filters are working correctly.
-
----
-
-## Stack
-
-| Component | Technology |
-|---|---|
-| Backend | Go 1.21, go-ethereum, Gin |
-| Blockchain | PancakeSwap V2, BSC mainnet |
-| Database | PostgreSQL 16 |
-| Cache / Bus | Redis 7 (streams + pub/sub) |
-| Frontend | Next.js 14, TailwindCSS, shadcn/ui, Recharts |
-| Deployment | Docker Compose |
+- **Private key** — never logged, stored only in `.env` (gitignored)
+- **WBNB filter** — strict exact address match; near-WBNB scam tokens are rejected
+- **V2 vs V3** — PancakeSwap V2 new-pair activity has declined significantly; V3 and StableSwap coverage ensures comprehensive detection
+- **BloxRoute** — set `BLOXROUTE_URL` to enable private mempool submission

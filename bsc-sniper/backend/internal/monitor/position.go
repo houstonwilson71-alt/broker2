@@ -3,6 +3,7 @@ package monitor
 import (
 	"context"
 	"math/big"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -30,24 +31,24 @@ type Seller interface {
 }
 
 type positionState struct {
-	pos         *db.Position
-	entryPrice  float64
-	athPrice    float64
-	tp1Hit      bool
-	openedAt    time.Time
+	pos        *db.Position
+	entryPrice float64
+	athPrice   float64
+	tp1Hit     bool
+	openedAt   time.Time
 }
 
 type Monitor struct {
-	cfg      *config.Config
-	rpc      *ethclient.Client
-	redis    *redisclient.Client
-	db       *db.DB
-	seller   Seller
-	logger   *zap.Logger
-	pairABI  abi.ABI
+	cfg     *config.Config
+	rpc     *ethclient.Client
+	redis   *redisclient.Client
+	db      *db.DB
+	seller  Seller
+	logger  *zap.Logger
+	pairABI abi.ABI
 
-	mu         sync.RWMutex
-	positions  map[string]*positionState
+	mu        sync.RWMutex
+	positions map[string]*positionState
 }
 
 func New(cfg *config.Config, rpc *ethclient.Client, redis *redisclient.Client,
@@ -116,7 +117,8 @@ func (m *Monitor) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			m.logger.Info("monitor shutting down")
+			m.logger.Info("monitor shutting down — persisting positions")
+			m.persistAllPositions()
 			return
 		case <-ticker.C:
 			m.tick(ctx)
@@ -124,7 +126,35 @@ func (m *Monitor) Run(ctx context.Context) {
 	}
 }
 
+// persistAllPositions flushes all in-memory positions to DB on graceful shutdown.
+func (m *Monitor) persistAllPositions() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	for _, state := range m.positions {
+		pos := state.pos
+		pos.ATHPriceBNB = bigFloatStr(state.athPrice)
+		pos.TP1Triggered = state.tp1Hit
+		if err := m.db.UpsertPosition(ctx, pos); err != nil {
+			m.logger.Error("persist position on shutdown", zap.Error(err), zap.String("token", pos.TokenAddress))
+		}
+	}
+	m.logger.Info("positions persisted", zap.Int("count", len(m.positions)))
+}
+
 func (m *Monitor) tick(ctx context.Context) {
+	// Panic recovery — never let a single bad position crash the monitor
+	defer func() {
+		if r := recover(); r != nil {
+			m.logger.Error("monitor panic recovered",
+				zap.Any("panic", r),
+				zap.ByteString("stack", debug.Stack()),
+			)
+		}
+	}()
+
 	m.mu.RLock()
 	tokens := make([]string, 0, len(m.positions))
 	for t := range m.positions {
@@ -157,12 +187,11 @@ func (m *Monitor) tick(ctx context.Context) {
 			continue
 		}
 
-		// Update ATH
+		// Update all-time high
 		if price > state.athPrice {
 			state.athPrice = price
 		}
 
-		// Calculate PnL
 		entryPrice := state.entryPrice
 		if entryPrice <= 0 {
 			m.mu.Unlock()
@@ -175,14 +204,14 @@ func (m *Monitor) tick(ctx context.Context) {
 		var sellPct int
 
 		switch {
-		// Take-Profit 1: +100%
+		// TP1: +100% → sell 50%
 		case !state.tp1Hit && pricePctGain >= m.cfg.TakeProfit1Pct:
 			action = "tp1"
 			sellPct = 50
 			state.tp1Hit = true
 			pos.TP1Triggered = true
 
-		// Trailing stop after TP1
+		// Trailing stop after TP1: drawdown >= TrailingStopPct from ATH
 		case state.tp1Hit:
 			drawdown := (state.athPrice - price) / state.athPrice * 100
 			if drawdown >= m.cfg.TrailingStopPct {
@@ -190,16 +219,14 @@ func (m *Monitor) tick(ctx context.Context) {
 				sellPct = 100
 			}
 
-		// Time-based exit: >2h and <20% gain
+		// Time exit: >2h open and <20% gain → sell 100%
 		case timeOpen > 2*time.Hour && pricePctGain < 20:
 			action = "time_exit"
 			sellPct = 100
 		}
 
-		// Update current price in position
 		pos.CurrentPriceBNB = bigFloatStr(price)
 		pos.ATHPriceBNB = bigFloatStr(state.athPrice)
-
 		m.mu.Unlock()
 
 		// Persist price update
@@ -215,36 +242,44 @@ func (m *Monitor) tick(ctx context.Context) {
 			"ath_price_bnb": state.athPrice,
 		})
 
-		if action != "" {
-			m.logger.Info("exit triggered",
-				zap.String("action", action),
-				zap.String("token", tokenAddr),
-				zap.String("symbol", pos.TokenSymbol),
-				zap.Float64("price_bnb", price),
-				zap.Float64("pnl_pct", pricePctGain),
-				zap.Int("sell_pct", sellPct),
-			)
-
-			sellErr := m.seller.ExecuteSell(ctx, pos, sellPct)
-			if sellErr != nil {
-				m.logger.Error("sell failed", zap.Error(sellErr), zap.String("token", tokenAddr))
-				continue
-			}
-
-			m.mu.Lock()
-			if sellPct == 100 {
-				pos.Status = "closed"
-				now := time.Now()
-				pos.ClosedAt = &now
-				delete(m.positions, tokenAddr)
-			} else {
-				// partial: keep tracking remaining
-				state.pos.TP1Triggered = true
-			}
-			m.mu.Unlock()
-
-			_ = m.db.UpsertPosition(ctx, pos)
+		if action == "" {
+			continue
 		}
+
+		m.logger.Info("exit triggered",
+			zap.String("action", action),
+			zap.String("token", tokenAddr),
+			zap.String("symbol", pos.TokenSymbol),
+			zap.Float64("price_bnb", price),
+			zap.Float64("pnl_pct", pricePctGain),
+			zap.Int("sell_pct", sellPct),
+		)
+
+		sellErr := m.seller.ExecuteSell(ctx, pos, sellPct)
+		if sellErr != nil {
+			m.logger.Error("sell failed", zap.Error(sellErr), zap.String("token", tokenAddr))
+			continue
+		}
+
+		m.mu.Lock()
+		if sellPct == 100 {
+			pos.Status = "closed"
+			now := time.Now()
+			pos.ClosedAt = &now
+			// Partial sell: update remaining amount
+			delete(m.positions, tokenAddr)
+		} else {
+			// TP1 partial sell: halve the token amount tracking
+			if st, ok := m.positions[tokenAddr]; ok {
+				if amtBig, ok2 := new(big.Int).SetString(pos.AmountTokens, 10); ok2 {
+					remaining := new(big.Int).Div(amtBig, big.NewInt(2))
+					pos.AmountTokens = remaining.String()
+					st.pos.AmountTokens = pos.AmountTokens
+				}
+			}
+		}
+		m.mu.Unlock()
+		_ = m.db.UpsertPosition(ctx, pos)
 	}
 }
 
@@ -253,7 +288,6 @@ func (m *Monitor) getCurrentPrice(ctx context.Context, pairAddress, tokenAddress
 	priceCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
-	// getReserves
 	data, err := m.pairABI.Pack("getReserves")
 	if err != nil {
 		return 0, err
@@ -273,7 +307,6 @@ func (m *Monitor) getCurrentPrice(ctx context.Context, pairAddress, tokenAddress
 		return 0, err
 	}
 
-	// token0
 	data2, err := m.pairABI.Pack("token0")
 	if err != nil {
 		return 0, err
@@ -298,15 +331,13 @@ func (m *Monitor) getCurrentPrice(ctx context.Context, pairAddress, tokenAddress
 		tokenReserve = res.Reserve0
 		bnbReserve = res.Reserve1
 	} else {
-		// Neither is WBNB — unexpected
 		return 0, nil
 	}
 
-	if tokenReserve.Sign() == 0 {
+	if tokenReserve == nil || tokenReserve.Sign() == 0 {
 		return 0, nil
 	}
 
-	// price = bnbReserve / tokenReserve (both in their native decimals, assume token has 18)
 	price, _ := new(big.Float).Quo(
 		new(big.Float).SetInt(bnbReserve),
 		new(big.Float).SetInt(tokenReserve),
