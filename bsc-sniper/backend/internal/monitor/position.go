@@ -231,11 +231,6 @@ func (m *Monitor) tick(ctx context.Context) {
 			continue
 		}
 
-		// Update all-time high
-		if price > state.athPrice {
-			state.athPrice = price
-		}
-
 		entryPrice := state.entryPrice
 		if entryPrice <= 0 {
 			m.mu.Unlock()
@@ -247,25 +242,10 @@ func (m *Monitor) tick(ctx context.Context) {
 		var sellPct int
 
 		switch {
-			// TP at +200%: sell exactly 50% of the held amount.
-		case !state.tp1Hit && price >= state.entryPrice*3.0:
+		// TP at +200%: price has tripled relative to entry. Sell 100% of the position.
+		case price >= state.entryPrice*3.0:
 			action = "tp_200"
-			sellPct = 50
-			state.tp1Hit = true
-			pos.TP1Triggered = true
-
-		// After the first 50% sell:
-		// - If price keeps rising to +300%, sell the remaining 50%.
-		// - If price drops 20% from the peak after the first sell, sell the remaining 50%.
-		case state.tp1Hit:
-			drawdown := (state.athPrice - price) / state.athPrice * 100
-			if price >= state.entryPrice*4.0 {
-				action = "tp_300"
-				sellPct = 100
-			} else if drawdown >= 20.0 {
-				action = "trailing_stop"
-				sellPct = 100
-			}
+			sellPct = 100
 
 		// Break-even stop-loss: if price drops to or below entry price, dump 100%.
 		case price <= state.entryPrice:
@@ -294,13 +274,19 @@ func (m *Monitor) tick(ctx context.Context) {
 			continue
 		}
 
-		m.logger.Info("exit triggered",
+		var msg string
+		switch action {
+		case "tp_200":
+			msg = "TP 200% hit, sold all"
+		case "breakeven_sl":
+			msg = "Break-even SL triggered, sold all"
+		}
+		m.logger.Info(msg,
 			zap.String("action", action),
 			zap.String("token", tokenAddr),
 			zap.String("symbol", pos.TokenSymbol),
 			zap.Float64("price_bnb", price),
 			zap.Float64("pnl_pct", pricePctGain),
-			zap.Int("sell_pct", sellPct),
 		)
 
 		sellErr := m.seller.ExecuteSell(ctx, pos, sellPct)
@@ -310,22 +296,10 @@ func (m *Monitor) tick(ctx context.Context) {
 		}
 
 		m.mu.Lock()
-		if sellPct == 100 {
-			pos.Status = "closed"
-			now := time.Now()
-			pos.ClosedAt = &now
-			// Partial sell: update remaining amount
-			delete(m.positions, tokenAddr)
-		} else {
-			// TP1 partial sell: halve the token amount tracking
-			if st, ok := m.positions[tokenAddr]; ok {
-				if amtBig, ok2 := new(big.Int).SetString(pos.AmountTokens, 10); ok2 {
-					remaining := new(big.Int).Div(amtBig, big.NewInt(2))
-					pos.AmountTokens = remaining.String()
-					st.pos.AmountTokens = pos.AmountTokens
-				}
-			}
-		}
+		pos.Status = "closed"
+		now := time.Now()
+		pos.ClosedAt = &now
+		delete(m.positions, tokenAddr)
 		m.mu.Unlock()
 		_ = m.db.UpsertPosition(ctx, pos)
 	}
