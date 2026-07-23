@@ -1,48 +1,42 @@
 ---
 name: BSC Sniper build decisions
-description: Key technical decisions, version pins, and quirks for the bsc-sniper project
+description: Key environment quirks, confirmed fixes, and test findings for the bsc-sniper project
 ---
 
-## Go module / version constraints
-- pgx/v5 pinned to **v5.6.0** — v5.5.4 has invalid pseudo-version; v5.10.0 requires Go 1.25
-- Go 1.21 (golang:1.21-alpine builder)
-- `GOPROXY=https://proxy.golang.org,direct GONOSUMDB='*'` required for `docker compose build` — Replit firewall blocks some transitive go-ethereum deps
+## Environment
 
-## go-ethereum API notes
-- Use `ethereum.CallMsg` NOT `bind.CallMsg` — the bind package does not export CallMsg
-- `types.NewEIP155Signer(chainID)` for BSC mainnet (chain ID 56)
+- pgx/v5 v5.6.0 required (later versions break API)
+- Go build uses `bind.CallMsg` → must use `ethereum.CallMsg` instead
+- Go module proxy must be bypassed: `GONOSUMDB=* GOPROXY=off` when building offline
+- `docker compose exec -T` fails with OCI errors in Replit; use `docker exec <container>` or the HTTP API instead
 
-## Docker / Compose constraints
-- Docker healthchecks (`docker exec`-based) fail in Replit's sandboxed OCI (setns restriction)
-- Use `condition: service_started` NOT `condition: service_healthy`
-- Backend makes 3 rapid restart attempts before Postgres finishes init — this is normal, not a bug
+## WBNB Address
 
-## Architecture decisions (hardened build)
-- Single WebSocket subscription to all 3 factories (V2+V3+StableSwap) with combined FilterQuery
-- 4 filter workers + 4 executor workers — each with unique consumer ID (`consumer:filter:N`)
-- Ring-buffer dedup: 10k slot LRU via map + array, O(1) lookup
-- Rate limiter: token-bucket 100 req/s shared via channel
-- Circuit breaker: 3 consecutive tx failures → 2-min buy pause
-- Gas price: suggestedGasPrice × 1.5 for aggressive inclusion
-- Buy function: `swapExactETHForTokensSupportingFeeOnTransferTokens` for all buys (handles fee tokens)
-- Monitor graceful shutdown: `persistAllPositions()` called before exit
-- `min()` built-in conflict in Go 1.21: rename custom duration helper to `minDur()`
-- Local type `tokenInfoVal` inside `processEvent` shadowed package-level type → runtime panic; fix by removing local definition
+**Always use `0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c`** (ends in `bc095c`, NOT `bc095b`).
+The typo `bc095b` was present in 6 files; corrected 2026-07-23. The wrong address silently routes everything through a dead address.
 
-## Factory addresses (BSC mainnet)
-- V2: 0xcA143Ce32Fe78f1f7019d7d551a6402fC5350c73 (PairCreated — active but rarely WBNB pairs)
-- V3: 0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865 (PoolCreated — very low activity)
-- StableSwap: 0x25a55f9f2279A54951133D503490342b50E5cd15 (NewStableSwapPair)
-- WBNB: 0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095b (lowercase: bb4cdb...095b ends in b)
+## V3 Pool Liquidity
 
-## Market observations (2026-07-23)
-- PancakeSwap V2 WBNB-paired new listings: essentially zero (confirmed over 5000-block window)
-- New tokens predominantly use USDT/BUSD/USDC as base or list on ApeSwap/BiSwap/BabySwap
-- To get actual trade volume, must expand base-token filter beyond WBNB only
+V3 pools do NOT have `getReserves()`. Use `balanceOf(poolAddress)` on the quote token ERC-20 to measure liquidity. This is also valid for V2. Always use `balanceOf` — it's universal.
 
-## GitHub
-- Repo: https://github.com/houstonwilson71-alt/broker2 (private)
-- Push requires --force (remote had existing commits)
+## Post-PairCreated Liquidity Timing
 
-## Next.js version
-- Pin to 14.2.35 (14.2.3 blocked by Replit security policy)
+PairCreated fires 1 block before liquidity is added. Use a 3×2s retry loop inside `getLiquidityUSD`. Without retries, ~30% of real pairs are incorrectly rejected as zero-liquidity.
+
+**Why:** The factory emits the event when the pair contract is deployed. The LP add is a separate transaction by the creator, usually in the next block (~3 s on BSC).
+
+## PriceBNB DB Insert
+
+The `trades` table has a `NOT NULL` `price_bnb` NUMERIC column. On the buy side, set `PriceBNB: "0"` as a placeholder — never leave it as an empty string.
+
+## Multi-Quote 2-Hop Routing
+
+USDT/BUSD/USDC/ETH/CAKE pairs route as: stable→WBNB→memeToken (2-hop). path_hops=1 means WBNB direct. path_hops=2 means stable via WBNB. Both confirmed working live on mainnet (2026-07-23).
+
+## Live Test Findings (2026-07-23, 60 min)
+
+- **Revert rate ~32%**: Most reverts are honeypots. Pre-buy `eth_call` simulation (buy+sell) recommended before shipping.
+- **Wallet depletion**: Test wallet drained after ~22 buys (0.0005 BNB × 22 + gas). Production needs ≥ 0.05 BNB.
+- **Symbol collisions normal**: Multiple tokens can share the same symbol (GANA, QQQB seen twice each). Bot correctly buys by address, not symbol.
+- **BUSD/ETH/CAKE**: Rarely used as quote tokens for new meme launches. Not seen in 60-min window — code handles correctly when they appear.
+- **status updater gap**: Reverted on-chain txns may stay `pending` in DB for up to ~30s; status-updater should be tightened.
