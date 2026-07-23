@@ -1,0 +1,1 @@
+- [BSC Sniper build decisions](bsc-sniper-build.md) — pgx/v5 v5.6.0 required, bind.CallMsg→ethereum.CallMsg, go proxy bypass needed
