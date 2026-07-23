@@ -55,6 +55,7 @@ type NewPairEvent struct {
 	QuoteToken  string `json:"quote_token"` // canonical-case address of the quote token
 	QuoteSymbol string `json:"quote_symbol"` // e.g. "WBNB", "USDT"
 	Source      string `json:"source"`      // "v2" | "v3" | "stable"
+	FeeTier     uint32 `json:"fee_tier"`    // V3 fee tier in hundredths of a bip (500, 2500, 10000); 0 for V2/Stable
 	BlockNumber uint64 `json:"block_number"`
 	Timestamp   int64  `json:"timestamp"`
 }
@@ -187,6 +188,7 @@ func (l *Listener) subscribe(ctx context.Context) error {
 
 	l.logger.Info("subscribed to PancakeSwap V2+V3+StableSwap factories",
 		zap.Int("quote_tokens", len(quoteTokens)),
+		zap.String("v3_fee_tiers", "all (0.05%, 0.25%, 1%)"),
 	)
 
 	for {
@@ -235,7 +237,7 @@ func (l *Listener) handleV2(ctx context.Context, factoryABI *abi.ABI, log *types
 	if !ok {
 		return
 	}
-	l.publish(ctx, token0, token1, decoded.Pair.Hex(), meme, quote, sym, "v2", log.BlockNumber)
+	l.publish(ctx, token0, token1, decoded.Pair.Hex(), meme, quote, sym, "v2", 0, log.BlockNumber)
 }
 
 // ─── V3 handler (PoolCreated) ─────────────────────────────────────────────────
@@ -266,7 +268,14 @@ func (l *Listener) handleV3(ctx context.Context, poolABI *abi.ABI, log *types.Lo
 	if !ok {
 		return
 	}
-	l.publish(ctx, token0, token1, poolAddr, meme, quote, sym, "v3", log.BlockNumber)
+
+	// Fee tier is the third indexed topic on V3 PoolCreated events.
+	var feeTier uint32
+	if len(log.Topics) >= 4 {
+		feeTier = uint32(new(big.Int).SetBytes(log.Topics[3].Bytes()).Uint64())
+	}
+
+	l.publish(ctx, token0, token1, poolAddr, meme, quote, sym, "v3", feeTier, log.BlockNumber)
 }
 
 // ─── StableSwap handler ───────────────────────────────────────────────────────
@@ -297,12 +306,12 @@ func (l *Listener) handleStable(ctx context.Context, stableABI *abi.ABI, log *ty
 	if !ok {
 		return
 	}
-	l.publish(ctx, token0, token1, pairAddr, meme, quote, sym, "stable", log.BlockNumber)
+	l.publish(ctx, token0, token1, pairAddr, meme, quote, sym, "stable", 0, log.BlockNumber)
 }
 
 // ─── Shared publish ───────────────────────────────────────────────────────────
 
-func (l *Listener) publish(ctx context.Context, token0, token1, pairAddr, meme, quote, quoteSymbol, source string, block uint64) {
+func (l *Listener) publish(ctx context.Context, token0, token1, pairAddr, meme, quote, quoteSymbol, source string, feeTier uint32, block uint64) {
 	if !l.ring.tryAdd(strings.ToLower(pairAddr)) {
 		l.logger.Debug("duplicate pair skipped", zap.String("pair", pairAddr))
 		return
@@ -316,17 +325,22 @@ func (l *Listener) publish(ctx context.Context, token0, token1, pairAddr, meme, 
 		QuoteToken:  quote,
 		QuoteSymbol: quoteSymbol,
 		Source:      source,
+		FeeTier:     feeTier,
 		BlockNumber: block,
 		Timestamp:   time.Now().Unix(),
 	}
 
-	l.logger.Info("PairCreated",
+	fields := []zap.Field{
 		zap.String("source", source),
 		zap.String("meme", meme),
 		zap.String("quote", quoteSymbol),
 		zap.String("pair", pairAddr),
 		zap.Uint64("block", block),
-	)
+	}
+	if feeTier > 0 {
+		fields = append(fields, zap.Uint32("fee_tier", feeTier))
+	}
+	l.logger.Info("PairCreated", fields...)
 
 	data, _ := json.Marshal(event)
 	if err := l.redis.PublishToStream(ctx, redisclient.StreamNewPairs, json.RawMessage(data)); err != nil {

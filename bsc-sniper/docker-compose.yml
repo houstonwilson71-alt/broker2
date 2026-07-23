@@ -40,7 +40,7 @@ services:
       REDIS_URL: redis://localhost:6379/0
       API_PORT: "8080"
       BUY_AMOUNT_BNB: "0.0005"
-      MIN_LIQUIDITY_USD: "8000"
+      MIN_LIQUIDITY_USD: "12000"
       MAX_TOP10_PCT: "30"
     depends_on:
       - postgres

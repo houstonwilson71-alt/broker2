@@ -47,8 +47,8 @@ const (
 	wbnbAddrLower = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"
 
 	// Elite safeguards
-	eliteLiquidityFloorUSD = 8000.0 // $8k minimum pool liquidity for this test
-	eliteMinRoundTripRatio = 0.90   // bnb back / bnb in; reject if efficiency < 90%
+	eliteLiquidityFloorUSD = 12000.0 // $12k minimum pool liquidity for this test
+	eliteMinRoundTripRatio = 0.95    // bnb back / bnb in; reject if efficiency < 95%
 
 	// Stablecoin addresses (BSC, all 18 decimals)
 	USDTAddr = "0x55d398326f99059fF775485246999027B3197955"
@@ -458,9 +458,44 @@ func (e *Engine) processEvent(ctx context.Context, event *listener.NewPairEvent)
 
 // getLiquidityUSD returns total liquidity in USD for any supported quote token.
 // Uses balanceOf(pool) on the quote ERC-20 — works for V2, V3, and StableSwap pools.
-// Retries up to 3 times (2 s apart) when the pool has zero balance, because
-// PairCreated fires before the creator adds initial liquidity.
+//
+// Test rule: check immediately. If liquidity is below the floor, wait 3 seconds and
+// check again. If it is still below the floor, reject. This lets pairs that receive
+// liquidity right after creation pass without letting low-liquidity pairs through.
 func (e *Engine) getLiquidityUSD(ctx context.Context, pairAddress, memeToken, quoteToken string) (float64, error) {
+	liq, err := e.checkLiquidityOnce(ctx, pairAddress, quoteToken)
+	if err != nil {
+		return 0, err
+	}
+	floor := e.cfg.MinLiquidityUSD
+	if eliteLiquidityFloorUSD > floor {
+		floor = eliteLiquidityFloorUSD
+	}
+	if liq >= floor {
+		return liq, nil
+	}
+
+	// First reading was below floor — wait 3 seconds and retry once.
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	case <-time.After(3 * time.Second):
+	}
+
+	liq, err = e.checkLiquidityOnce(ctx, pairAddress, quoteToken)
+	if err != nil {
+		return 0, err
+	}
+	if liq < floor {
+		return liq, fmt.Errorf("liquidity below $%.0f after 3s retry: $%.0f", floor, liq)
+	}
+	return liq, nil
+}
+
+// checkLiquidityOnce reads the quote-token balance of the pool and converts it to
+// a USD liquidity estimate. A zero balance returns 0, nil (not an error) so the
+// caller can decide whether to retry.
+func (e *Engine) checkLiquidityOnce(ctx context.Context, pairAddress, quoteToken string) (float64, error) {
 	poolAddr := common.HexToAddress(pairAddress)
 	quoteAddr := common.HexToAddress(quoteToken)
 
@@ -469,39 +504,19 @@ func (e *Engine) getLiquidityUSD(ctx context.Context, pairAddress, memeToken, qu
 		return 0, fmt.Errorf("pack balanceOf: %w", err)
 	}
 
-	const maxRetries = 3
-	const retryDelay = 2 * time.Second
-
-	var quoteBal *big.Int
-	for attempt := 0; attempt <= maxRetries; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return 0, ctx.Err()
-			case <-time.After(retryDelay):
-			}
-		}
-		e.acquireRPC()
-		result, rErr := e.rpc.CallContract(ctx, ethereum.CallMsg{To: &quoteAddr, Data: data}, nil)
-		if rErr != nil {
-			return 0, fmt.Errorf("balanceOf quote token: %w", rErr)
-		}
-		var bal *big.Int
-		if uErr := e.erc20ABI.UnpackIntoInterface(&bal, "balanceOf", result); uErr != nil {
-			return 0, fmt.Errorf("unpack balanceOf: %w", uErr)
-		}
-		if bal != nil && bal.Sign() > 0 {
-			quoteBal = bal
-			break
-		}
-		// Still zero — liquidity not yet added; retry unless last attempt
+	e.acquireRPC()
+	result, rErr := e.rpc.CallContract(ctx, ethereum.CallMsg{To: &quoteAddr, Data: data}, nil)
+	if rErr != nil {
+		return 0, fmt.Errorf("balanceOf quote token: %w", rErr)
+	}
+	var bal *big.Int
+	if uErr := e.erc20ABI.UnpackIntoInterface(&bal, "balanceOf", result); uErr != nil {
+		return 0, fmt.Errorf("unpack balanceOf: %w", uErr)
+	}
+	if bal == nil || bal.Sign() == 0 {
+		return 0, nil
 	}
 
-	if quoteBal == nil || quoteBal.Sign() == 0 {
-		return 0, fmt.Errorf("zero quote balance after %d retries", maxRetries)
-	}
-
-	// Get USD price for this quote token
 	pricePerQuote, err := e.getQuoteTokenPriceUSD(ctx, quoteToken)
 	if err != nil {
 		return 0, fmt.Errorf("price fetch for %s: %w", quoteSymbolFor(quoteToken), err)
@@ -509,7 +524,7 @@ func (e *Engine) getLiquidityUSD(ctx context.Context, pairAddress, memeToken, qu
 
 	decimals := quoteTokenDecimals(quoteToken) // 1e18 for all whitelisted BSC tokens
 	quoteF, _ := new(big.Float).Quo(
-		new(big.Float).SetInt(quoteBal),
+		new(big.Float).SetInt(bal),
 		new(big.Float).SetFloat64(decimals),
 	).Float64()
 
