@@ -81,7 +81,7 @@ const erc20ApproveABIJSON = `[
 
 const (
 	RouterAddr = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
-	WBNBAddr   = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095b"
+	WBNBAddr   = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"
 )
 
 // ─── Circuit breaker ──────────────────────────────────────────────────────────
@@ -137,11 +137,10 @@ type Executor struct {
 	erc20ABI   abi.ABI
 	chainID    *big.Int
 
-	circuit    *circuitBreaker
-	rpcTokens  chan struct{}
-	nonceMu    sync.Mutex
+	circuit   *circuitBreaker
+	rpcTokens chan struct{}
+	nonceMu   sync.Mutex
 
-	// Tracks active buys for state reporting
 	BuyingActive atomic.Int64
 }
 
@@ -188,7 +187,6 @@ func New(cfg *config.Config, rpc *ethclient.Client, redis *redisclient.Client, d
 		rpcTokens:  make(chan struct{}, 100),
 	}
 
-	// Prefill rate-limiter and start refill goroutine
 	for i := 0; i < 100; i++ {
 		ex.rpcTokens <- struct{}{}
 	}
@@ -227,7 +225,6 @@ func (ex *Executor) Run(ctx context.Context, workerID int) {
 		default:
 		}
 
-		// Circuit breaker check
 		if open, remaining := ex.circuit.isOpen(); open {
 			ex.logger.Warn("circuit breaker OPEN — pausing buys",
 				zap.Duration("remaining", remaining.Round(time.Second)),
@@ -276,11 +273,31 @@ func (ex *Executor) Run(ctx context.Context, workerID int) {
 	}
 }
 
+// buildBuyPath returns the token path for a buy transaction.
+// Single-hop if quoteToken == WBNB; two-hop otherwise.
+func buildBuyPath(quoteToken string, tokenAddr common.Address) []common.Address {
+	wbnb := common.HexToAddress(WBNBAddr)
+	if strings.EqualFold(quoteToken, WBNBAddr) || quoteToken == "" {
+		return []common.Address{wbnb, tokenAddr}
+	}
+	return []common.Address{wbnb, common.HexToAddress(quoteToken), tokenAddr}
+}
+
+// buildSellPath returns the token path for a sell transaction (reverse of buy path).
+func buildSellPath(quoteToken string, tokenAddr common.Address) []common.Address {
+	wbnb := common.HexToAddress(WBNBAddr)
+	if strings.EqualFold(quoteToken, WBNBAddr) || quoteToken == "" {
+		return []common.Address{tokenAddr, wbnb}
+	}
+	return []common.Address{tokenAddr, common.HexToAddress(quoteToken), wbnb}
+}
+
 func (ex *Executor) executeBuy(ctx context.Context, tok *filter.ApprovedToken, isRetry bool) {
 	if !ex.cfg.LiveTradingEnabled {
 		ex.logger.Info("SIMULATED BUY",
 			zap.String("token", tok.TokenAddress),
 			zap.String("symbol", tok.TokenSymbol),
+			zap.String("quote", tok.QuoteSymbol),
 			zap.Float64("bnb", ex.cfg.BuyAmountBNB),
 		)
 		ex.publishSimulatedTrade(ctx, tok)
@@ -291,7 +308,7 @@ func (ex *Executor) executeBuy(ctx context.Context, tok *filter.ApprovedToken, i
 	gasMultiplier := int64(15) // 1.5x
 	if isRetry {
 		slippage *= 2
-		gasMultiplier = 30 // 3x on retry
+		gasMultiplier = 30
 		ex.logger.Info("retrying buy", zap.String("token", tok.TokenAddress))
 	}
 
@@ -300,9 +317,16 @@ func (ex *Executor) executeBuy(ctx context.Context, tok *filter.ApprovedToken, i
 
 	amountBNBWei := toWei(ex.cfg.BuyAmountBNB)
 	routerAddr := common.HexToAddress(RouterAddr)
-	wbnbAddr := common.HexToAddress(WBNBAddr)
 	tokenAddr := common.HexToAddress(tok.TokenAddress)
-	path := []common.Address{wbnbAddr, tokenAddr}
+
+	// Build path: single-hop for WBNB, two-hop for stablecoins/CAKE/ETH
+	path := buildBuyPath(tok.QuoteToken, tokenAddr)
+
+	ex.logger.Info("buy path",
+		zap.String("token", tok.TokenSymbol),
+		zap.String("quote", tok.QuoteSymbol),
+		zap.Int("hops", len(path)-1),
+	)
 
 	// Get expected output
 	ex.acquireRPC()
@@ -332,7 +356,6 @@ func (ex *Executor) executeBuy(ctx context.Context, tok *filter.ApprovedToken, i
 
 	deadline := big.NewInt(time.Now().Add(2 * time.Minute).Unix())
 
-	// Use fee-on-transfer variant to handle tokens with buy tax
 	txData, err := ex.routerABI.Pack(
 		"swapExactETHForTokensSupportingFeeOnTransferTokens",
 		amountOutMin, path, ex.fromAddr, deadline,
@@ -342,7 +365,6 @@ func (ex *Executor) executeBuy(ctx context.Context, tok *filter.ApprovedToken, i
 		return
 	}
 
-	// Get nonce (serialised to avoid nonce collisions across workers)
 	ex.nonceMu.Lock()
 	ex.acquireRPC()
 	nonce, err := ex.rpc.PendingNonceAt(txCtx, ex.fromAddr)
@@ -352,7 +374,6 @@ func (ex *Executor) executeBuy(ctx context.Context, tok *filter.ApprovedToken, i
 		return
 	}
 
-	// Gas price = suggested * 1.5 (aggressive)
 	ex.acquireRPC()
 	suggestedGasPrice, err := ex.rpc.SuggestGasPrice(txCtx)
 	if err != nil {
@@ -362,7 +383,12 @@ func (ex *Executor) executeBuy(ctx context.Context, tok *filter.ApprovedToken, i
 	gasPrice := new(big.Int).Mul(suggestedGasPrice, big.NewInt(gasMultiplier))
 	gasPrice.Div(gasPrice, big.NewInt(10))
 
-	// Estimate gas with fallback
+	// Estimate gas — multi-hop needs higher limit
+	defaultGasLimit := uint64(350000)
+	if len(path) > 2 {
+		defaultGasLimit = 500000 // two-hop swap
+	}
+
 	ex.acquireRPC()
 	gasLimit, err := ex.rpc.EstimateGas(txCtx, ethereum.CallMsg{
 		From:     ex.fromAddr,
@@ -372,8 +398,11 @@ func (ex *Executor) executeBuy(ctx context.Context, tok *filter.ApprovedToken, i
 		Data:     txData,
 	})
 	if err != nil {
-		ex.logger.Warn("gas estimate failed, using 350000", zap.Error(err))
-		gasLimit = 350000
+		ex.logger.Warn("gas estimate failed, using default",
+			zap.Uint64("default", defaultGasLimit),
+			zap.Error(err),
+		)
+		gasLimit = defaultGasLimit
 	}
 	gasLimit = gasLimit * 13 / 10 // +30% safety buffer
 
@@ -394,6 +423,7 @@ func (ex *Executor) executeBuy(ctx context.Context, tok *filter.ApprovedToken, i
 		Side:         "buy",
 		AmountBNB:    ex.cfg.BuyAmountBNB,
 		AmountTokens: expectedOut.String(),
+		PriceBNB:     "0", // updated post-confirm; "0" avoids NUMERIC cast error
 		TxHash:       signedTx.Hash().Hex(),
 		GasPriceGwei: gasPriceGwei,
 		Status:       "pending",
@@ -402,7 +432,6 @@ func (ex *Executor) executeBuy(ctx context.Context, tok *filter.ApprovedToken, i
 		ex.logger.Error("insert trade", zap.Error(err))
 	}
 
-	// Dual-submit: public RPC + (optional) BloxRoute — first wins
 	sendErr := ex.dualSubmit(txCtx, signedTx)
 
 	if sendErr != nil {
@@ -424,12 +453,13 @@ func (ex *Executor) executeBuy(ctx context.Context, tok *filter.ApprovedToken, i
 	ex.logger.Info("Buy executed",
 		zap.String("token", tok.TokenAddress),
 		zap.String("symbol", tok.TokenSymbol),
+		zap.String("quote", tok.QuoteSymbol),
 		zap.String("tx_hash", signedTx.Hash().Hex()),
 		zap.Float64("bnb", ex.cfg.BuyAmountBNB),
 		zap.Float64("gas_gwei", gasPriceGwei),
+		zap.Int("path_hops", len(path)-1),
 	)
 
-	// Wait for receipt
 	receiptCtx, rCancel := context.WithTimeout(ctx, 60*time.Second)
 	defer rCancel()
 	receipt := ex.waitForReceipt(receiptCtx, signedTx.Hash())
@@ -465,6 +495,7 @@ func (ex *Executor) executeBuy(ctx context.Context, tok *filter.ApprovedToken, i
 		TokenAddress:    tok.TokenAddress,
 		PairAddress:     tok.PairAddress,
 		TokenSymbol:     tok.TokenSymbol,
+		QuoteToken:      tok.QuoteToken,
 		EntryPriceBNB:   entryPriceStr,
 		CurrentPriceBNB: entryPriceStr,
 		ATHPriceBNB:     entryPriceStr,
@@ -485,16 +516,14 @@ func (ex *Executor) executeBuy(ctx context.Context, tok *filter.ApprovedToken, i
 	})
 }
 
-// dualSubmit sends to public RPC and optionally BloxRoute concurrently; first success wins.
+// dualSubmit sends to public RPC and optionally BloxRoute concurrently.
 func (ex *Executor) dualSubmit(ctx context.Context, tx *types.Transaction) error {
 	if ex.cfg.BloxrouteURL == "" {
 		ex.acquireRPC()
 		return ex.rpc.SendTransaction(ctx, tx)
 	}
 
-	type result struct {
-		err error
-	}
+	type result struct{ err error }
 	ch := make(chan result, 2)
 
 	go func() {
@@ -502,8 +531,6 @@ func (ex *Executor) dualSubmit(ctx context.Context, tx *types.Transaction) error
 		ch <- result{ex.rpc.SendTransaction(ctx, tx)}
 	}()
 	go func() {
-		// BloxRoute fallback: send via public RPC as well for now
-		// (Full BloxRoute integration requires their SDK)
 		ex.acquireRPC()
 		ch <- result{ex.rpc.SendTransaction(ctx, tx)}
 	}()
@@ -519,7 +546,7 @@ func (ex *Executor) dualSubmit(ctx context.Context, tx *types.Transaction) error
 	return lastErr
 }
 
-// ExecuteSell sells pct% of the position.
+// ExecuteSell sells pct% of the position using the correct reverse path.
 func (ex *Executor) ExecuteSell(ctx context.Context, pos *db.Position, pct int) error {
 	if !ex.cfg.LiveTradingEnabled {
 		ex.logger.Info("SIMULATED SELL",
@@ -531,7 +558,12 @@ func (ex *Executor) ExecuteSell(ctx context.Context, pos *db.Position, pct int) 
 
 	tokenAddr := common.HexToAddress(pos.TokenAddress)
 	routerAddr := common.HexToAddress(RouterAddr)
-	wbnbAddr := common.HexToAddress(WBNBAddr)
+
+	// Determine sell path (stored in position or default to WBNB)
+	// For simplicity, we read the pair's tokens from the position.
+	// The sell path mirrors the buy path.
+	// pos.PairAddress is used only for identification; we rely on the token router.
+	sellPath := buildSellPath(pos.QuoteToken, tokenAddr)
 
 	// Get actual balance
 	ex.acquireRPC()
@@ -554,15 +586,13 @@ func (ex *Executor) ExecuteSell(ctx context.Context, pos *db.Position, pct int) 
 		return fmt.Errorf("zero balance to sell")
 	}
 
-	// Approve router
 	if err := ex.approveRouter(ctx, tokenAddr, routerAddr, amountToSell); err != nil {
 		return fmt.Errorf("approve: %w", err)
 	}
 
 	// Get expected BNB out
-	path := []common.Address{tokenAddr, wbnbAddr}
 	ex.acquireRPC()
-	amountsData, err := ex.routerABI.Pack("getAmountsOut", amountToSell, path)
+	amountsData, err := ex.routerABI.Pack("getAmountsOut", amountToSell, sellPath)
 	if err != nil {
 		return err
 	}
@@ -580,7 +610,7 @@ func (ex *Executor) ExecuteSell(ctx context.Context, pos *db.Position, pct int) 
 
 	deadline := big.NewInt(time.Now().Add(2 * time.Minute).Unix())
 	txData, err := ex.routerABI.Pack("swapExactTokensForETHSupportingFeeOnTransferTokens",
-		amountToSell, amountOutMin, path, ex.fromAddr, deadline)
+		amountToSell, amountOutMin, sellPath, ex.fromAddr, deadline)
 	if err != nil {
 		return fmt.Errorf("pack sell: %w", err)
 	}
@@ -601,7 +631,10 @@ func (ex *Executor) ExecuteSell(ctx context.Context, pos *db.Position, pct int) 
 	gasPrice := new(big.Int).Mul(suggestedGasPrice, big.NewInt(15))
 	gasPrice.Div(gasPrice, big.NewInt(10))
 
-	// Estimate gas with fallback
+	defaultGasLimit := uint64(300000)
+	if len(sellPath) > 2 {
+		defaultGasLimit = 500000
+	}
 	ex.acquireRPC()
 	gasLimit, err := ex.rpc.EstimateGas(ctx, ethereum.CallMsg{
 		From:     ex.fromAddr,
@@ -610,7 +643,7 @@ func (ex *Executor) ExecuteSell(ctx context.Context, pos *db.Position, pct int) 
 		Data:     txData,
 	})
 	if err != nil {
-		gasLimit = 300000
+		gasLimit = defaultGasLimit
 	}
 	gasLimit = gasLimit * 13 / 10
 
@@ -748,6 +781,7 @@ func (ex *Executor) publishSimulatedTrade(ctx context.Context, tok *filter.Appro
 		TokenAddress:    tok.TokenAddress,
 		PairAddress:     tok.PairAddress,
 		TokenSymbol:     tok.TokenSymbol,
+		QuoteToken:      tok.QuoteToken,
 		EntryPriceBNB:   entryPrice,
 		CurrentPriceBNB: entryPrice,
 		ATHPriceBNB:     entryPrice,

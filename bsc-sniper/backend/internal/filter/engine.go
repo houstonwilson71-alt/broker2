@@ -33,7 +33,8 @@ const erc20ABIJSON = `[
   {"inputs":[],"name":"name","outputs":[{"internalType":"string","name":"","type":"string"}],"stateMutability":"view","type":"function"},
   {"inputs":[],"name":"symbol","outputs":[{"internalType":"string","name":"","type":"string"}],"stateMutability":"view","type":"function"},
   {"inputs":[],"name":"decimals","outputs":[{"internalType":"uint8","name":"","type":"uint8"}],"stateMutability":"view","type":"function"},
-  {"inputs":[],"name":"totalSupply","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"}
+  {"inputs":[],"name":"totalSupply","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+  {"inputs":[{"internalType":"address","name":"account","type":"address"}],"name":"balanceOf","outputs":[{"internalType":"uint256","name":"","type":"uint256"}],"stateMutability":"view","type":"function"}
 ]`
 
 const routerABIJSON = `[
@@ -42,21 +43,42 @@ const routerABIJSON = `[
 
 const (
 	RouterAddress = "0x10ED43C718714eb63d5aA57B78B54704E256024E"
-	WBNBAddr      = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095b"
+	WBNBAddr      = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"
+	wbnbAddrLower = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"
+
+	// Stablecoin addresses (BSC, all 18 decimals)
+	USDTAddr = "0x55d398326f99059fF775485246999027B3197955"
+	BUSDAddr = "0xe9e7CEA3DedcA5984780Bafc599bD69ADd087D56"
+	USDCAddr = "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d"
+	// Variable-price quote tokens
+	ETHAddr  = "0x2170Ed0880ac9A755fd29B2688956BD959F933F8"
+	CAKEAddr = "0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82"
+
+	// On-chain reference pairs for fallback pricing
+	wbnbUsdtPair = "0x16b9a82891338f9bA80E2D6970FddA79D1eb0daE"
+	cakeWbnbPair = "0x0eD7e52944161450477ee417DE9Cd3a859b14fD0"
+	ethWbnbPair  = "0x74E4716E431f45807DCF19f284c7aA99F18a4fbc"
 )
 
-// ─── BNB price cache (shared across all workers) ──────────────────────────────
+// ─── Price caches (shared across all workers) ─────────────────────────────────
 
 var (
 	cachedBNBPrice   float64
 	cachedBNBPriceAt time.Time
 	bnbPriceMu       sync.RWMutex
+
+	// Generic price cache for CAKE, ETH, etc.
+	tokenPriceCache   = map[string]float64{}
+	tokenPriceCacheAt = map[string]time.Time{}
+	tokenPriceMu      sync.RWMutex
 )
 
 // ApprovedToken is the event published to stream:approved_tokens.
 type ApprovedToken struct {
 	TokenAddress string  `json:"token_address"`
 	PairAddress  string  `json:"pair_address"`
+	QuoteToken   string  `json:"quote_token"`  // canonical-case address
+	QuoteSymbol  string  `json:"quote_symbol"` // "WBNB" | "USDT" | ...
 	TokenSymbol  string  `json:"token_symbol"`
 	TokenName    string  `json:"token_name"`
 	Decimals     int     `json:"decimals"`
@@ -78,10 +100,8 @@ type Engine struct {
 	erc20ABI  abi.ABI
 	routerABI abi.ABI
 
-	// rate limiter: max 100 RPC calls/second shared across all filter goroutines
 	rpcTokens chan struct{}
-	// active processing counter (for state reporting)
-	Active atomic.Int64
+	Active    atomic.Int64
 }
 
 func New(cfg *config.Config, rpc *ethclient.Client, redis *redisclient.Client, database *db.DB, logger *zap.Logger) (*Engine, error) {
@@ -110,7 +130,6 @@ func New(cfg *config.Config, rpc *ethclient.Client, redis *redisclient.Client, d
 		rpcTokens: make(chan struct{}, 100),
 	}
 
-	// Prefill the rate-limiter bucket and start refill goroutine
 	for i := 0; i < 100; i++ {
 		e.rpcTokens <- struct{}{}
 	}
@@ -120,7 +139,7 @@ func New(cfg *config.Config, rpc *ethclient.Client, redis *redisclient.Client, d
 }
 
 func (e *Engine) refillRPCTokens() {
-	ticker := time.NewTicker(time.Second / 100) // 100 tokens per second
+	ticker := time.NewTicker(time.Second / 100)
 	defer ticker.Stop()
 	for range ticker.C {
 		select {
@@ -184,20 +203,36 @@ func (e *Engine) Run(ctx context.Context, workerID int) {
 }
 
 func (e *Engine) processEvent(ctx context.Context, event *listener.NewPairEvent) {
-	// Strict 2.5 second total deadline
-	filterCtx, cancel := context.WithTimeout(ctx, 2500*time.Millisecond)
+	// Liquidity check retries up to 3×2s = 6s; other checks run in parallel.
+	// Allow 15s total so the retry window fits without racing to a deadline.
+	filterCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
-	// Determine meme token
-	wbnb := strings.ToLower(WBNBAddr)
+	// Resolve meme and quote tokens
 	memeToken := event.MemeToken
-	if memeToken == "" {
-		// Fallback compute
-		if strings.ToLower(event.Token0) == wbnb {
+	quoteToken := event.QuoteToken
+	quoteSymbol := event.QuoteSymbol
+
+	// Fallback: derive from token0/token1 if listener didn't populate
+	if memeToken == "" || quoteToken == "" {
+		t0 := strings.ToLower(event.Token0)
+		t1 := strings.ToLower(event.Token1)
+		if isQuoteToken(t0) && !isQuoteToken(t1) {
 			memeToken = event.Token1
-		} else {
+			quoteToken = event.Token0
+		} else if isQuoteToken(t1) && !isQuoteToken(t0) {
 			memeToken = event.Token0
+			quoteToken = event.Token1
+		} else {
+			e.logger.Debug("pair has no recognised quote token, skipping",
+				zap.String("t0", event.Token0),
+				zap.String("t1", event.Token1),
+			)
+			return
 		}
+	}
+	if quoteSymbol == "" {
+		quoteSymbol = quoteSymbolFor(quoteToken)
 	}
 
 	result := &db.FilterResult{
@@ -216,29 +251,27 @@ func (e *Engine) processEvent(ctx context.Context, event *listener.NewPairEvent)
 	tokenInfoCh := make(chan checkResult, 1)
 	honeypotCh := make(chan checkResult, 1)
 
-	// All checks run in parallel with shared 2.5s deadline
 	go func() {
-		checkCtx, c := context.WithTimeout(filterCtx, 2*time.Second)
-		defer c()
-		liq, err := e.getLiquidityUSD(checkCtx, event.PairAddress, memeToken)
+		// Liquidity has its own internal retry loop; give it the full filterCtx.
+		liq, err := e.getLiquidityUSD(filterCtx, event.PairAddress, memeToken, quoteToken)
 		liquidityCh <- checkResult{"liquidity", err, liq}
 	}()
 	go func() {
-		checkCtx, c := context.WithTimeout(filterCtx, 2*time.Second)
+		checkCtx, c := context.WithTimeout(filterCtx, 3*time.Second)
 		defer c()
 		age, err := e.getTokenAge(checkCtx, event.BlockNumber)
 		ageCh <- checkResult{"age", err, age}
 	}()
 	go func() {
-		checkCtx, c := context.WithTimeout(filterCtx, 2*time.Second)
+		checkCtx, c := context.WithTimeout(filterCtx, 3*time.Second)
 		defer c()
 		info, err := e.getTokenInfo(checkCtx, memeToken)
 		tokenInfoCh <- checkResult{"tokeninfo", err, info}
 	}()
 	go func() {
-		checkCtx, c := context.WithTimeout(filterCtx, 2*time.Second)
+		checkCtx, c := context.WithTimeout(filterCtx, 3*time.Second)
 		defer c()
-		hp, err := e.checkHoneypot(checkCtx, memeToken, event.PairAddress)
+		hp, err := e.checkHoneypot(checkCtx, memeToken, event.PairAddress, quoteToken)
 		honeypotCh <- checkResult{"honeypot", err, hp}
 	}()
 
@@ -246,7 +279,6 @@ func (e *Engine) processEvent(ctx context.Context, event *listener.NewPairEvent)
 	passed := true
 	var tInfo tokenInfoVal
 
-	// Collect all four results within deadline
 	for i := 0; i < 4; i++ {
 		var res checkResult
 		select {
@@ -279,7 +311,6 @@ func (e *Engine) processEvent(ctx context.Context, event *listener.NewPairEvent)
 		case "age":
 			if res.err != nil {
 				e.logger.Warn("age check failed", zap.Error(res.err))
-				// non-fatal: age check failing doesn't block
 			} else {
 				age := res.val.(int64)
 				result.AgeSeconds = age
@@ -291,8 +322,7 @@ func (e *Engine) processEvent(ctx context.Context, event *listener.NewPairEvent)
 
 		case "tokeninfo":
 			if res.err == nil {
-				info := res.val.(tokenInfoVal)
-				tInfo = info
+				tInfo = res.val.(tokenInfoVal)
 			}
 
 		case "honeypot":
@@ -309,7 +339,6 @@ func (e *Engine) processEvent(ctx context.Context, event *listener.NewPairEvent)
 		}
 	}
 
-	// BSCscan holder check (best-effort, outside 2.5s window — fire-and-forget result)
 	holderCount, top10Pct, rugScore := e.getBSCscanData(ctx, memeToken)
 	result.HolderCount = holderCount
 	result.Top10Pct = top10Pct
@@ -333,7 +362,6 @@ func (e *Engine) processEvent(ctx context.Context, event *listener.NewPairEvent)
 	result.Passed = passed
 	result.FailReasons = failReasons
 
-	// Persist token metadata
 	_ = e.db.UpsertToken(filterCtx, &db.Token{
 		Address:     memeToken,
 		Symbol:      tInfo.symbol,
@@ -350,6 +378,7 @@ func (e *Engine) processEvent(ctx context.Context, event *listener.NewPairEvent)
 	if !passed {
 		e.logger.Info("token rejected",
 			zap.String("token", memeToken),
+			zap.String("quote", quoteSymbol),
 			zap.String("source", event.Source),
 			zap.Strings("reasons", failReasons),
 		)
@@ -361,6 +390,7 @@ func (e *Engine) processEvent(ctx context.Context, event *listener.NewPairEvent)
 	e.logger.Info("token APPROVED",
 		zap.String("token", memeToken),
 		zap.String("symbol", tInfo.symbol),
+		zap.String("quote", quoteSymbol),
 		zap.String("pair", event.PairAddress),
 		zap.String("source", event.Source),
 		zap.Float64("liquidity_usd", result.LiquidityUSD),
@@ -369,6 +399,8 @@ func (e *Engine) processEvent(ctx context.Context, event *listener.NewPairEvent)
 	approved := &ApprovedToken{
 		TokenAddress: memeToken,
 		PairAddress:  event.PairAddress,
+		QuoteToken:   quoteToken,
+		QuoteSymbol:  quoteSymbol,
 		TokenSymbol:  tInfo.symbol,
 		TokenName:    tInfo.name,
 		Decimals:     tInfo.decimals,
@@ -387,62 +419,205 @@ func (e *Engine) processEvent(ctx context.Context, event *listener.NewPairEvent)
 	})
 }
 
-// ─── Individual checks ────────────────────────────────────────────────────────
+// ─── Liquidity calculation ────────────────────────────────────────────────────
 
-func (e *Engine) getLiquidityUSD(ctx context.Context, pairAddress, memeToken string) (float64, error) {
-	pairAddr := common.HexToAddress(pairAddress)
+// getLiquidityUSD returns total liquidity in USD for any supported quote token.
+// Uses balanceOf(pool) on the quote ERC-20 — works for V2, V3, and StableSwap pools.
+// Retries up to 3 times (2 s apart) when the pool has zero balance, because
+// PairCreated fires before the creator adds initial liquidity.
+func (e *Engine) getLiquidityUSD(ctx context.Context, pairAddress, memeToken, quoteToken string) (float64, error) {
+	poolAddr := common.HexToAddress(pairAddress)
+	quoteAddr := common.HexToAddress(quoteToken)
 
-	e.acquireRPC()
+	data, err := e.erc20ABI.Pack("balanceOf", poolAddr)
+	if err != nil {
+		return 0, fmt.Errorf("pack balanceOf: %w", err)
+	}
+
+	const maxRetries = 3
+	const retryDelay = 2 * time.Second
+
+	var quoteBal *big.Int
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			case <-time.After(retryDelay):
+			}
+		}
+		e.acquireRPC()
+		result, rErr := e.rpc.CallContract(ctx, ethereum.CallMsg{To: &quoteAddr, Data: data}, nil)
+		if rErr != nil {
+			return 0, fmt.Errorf("balanceOf quote token: %w", rErr)
+		}
+		var bal *big.Int
+		if uErr := e.erc20ABI.UnpackIntoInterface(&bal, "balanceOf", result); uErr != nil {
+			return 0, fmt.Errorf("unpack balanceOf: %w", uErr)
+		}
+		if bal != nil && bal.Sign() > 0 {
+			quoteBal = bal
+			break
+		}
+		// Still zero — liquidity not yet added; retry unless last attempt
+	}
+
+	if quoteBal == nil || quoteBal.Sign() == 0 {
+		return 0, fmt.Errorf("zero quote balance after %d retries", maxRetries)
+	}
+
+	// Get USD price for this quote token
+	pricePerQuote, err := e.getQuoteTokenPriceUSD(ctx, quoteToken)
+	if err != nil {
+		return 0, fmt.Errorf("price fetch for %s: %w", quoteSymbolFor(quoteToken), err)
+	}
+
+	decimals := quoteTokenDecimals(quoteToken) // 1e18 for all whitelisted BSC tokens
+	quoteF, _ := new(big.Float).Quo(
+		new(big.Float).SetInt(quoteBal),
+		new(big.Float).SetFloat64(decimals),
+	).Float64()
+
+	// Total pool liquidity ≈ 2× the quote side (AMM invariant: each side ≈ equal value)
+	return quoteF * pricePerQuote * 2, nil
+}
+
+// getQuoteTokenPriceUSD returns the USD price for a given quote token.
+// Results are cached for 30 seconds.
+// Stablecoins return 1.0 immediately.
+// WBNB uses the existing BNB price logic.
+// CAKE and ETH use CoinGecko with on-chain fallback.
+func (e *Engine) getQuoteTokenPriceUSD(ctx context.Context, quoteToken string) (float64, error) {
+	lower := strings.ToLower(quoteToken)
+
+	// Stablecoins: always $1
+	switch lower {
+	case strings.ToLower(USDTAddr),
+		strings.ToLower(BUSDAddr),
+		strings.ToLower(USDCAddr):
+		return 1.0, nil
+	}
+
+	// WBNB: existing logic
+	if lower == wbnbAddrLower {
+		p := e.getBNBPrice(ctx)
+		if p <= 0 {
+			return 0, fmt.Errorf("could not determine BNB price")
+		}
+		return p, nil
+	}
+
+	// CAKE / ETH — check cache first
+	tokenPriceMu.RLock()
+	if t, ok := tokenPriceCacheAt[lower]; ok && time.Since(t) < 30*time.Second {
+		p := tokenPriceCache[lower]
+		tokenPriceMu.RUnlock()
+		return p, nil
+	}
+	tokenPriceMu.RUnlock()
+
+	// Try CoinGecko
+	cgID := ""
+	switch lower {
+	case strings.ToLower(CAKEAddr):
+		cgID = "pancakeswap-token"
+	case strings.ToLower(ETHAddr):
+		cgID = "ethereum"
+	}
+
+	if cgID != "" {
+		reqCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
+		defer cancel()
+		req, err := http.NewRequestWithContext(reqCtx, "GET",
+			fmt.Sprintf("https://api.coingecko.com/api/v3/simple/price?ids=%s&vs_currencies=usd", cgID), nil)
+		if err == nil {
+			req.Header.Set("Accept", "application/json")
+			resp, err := http.DefaultClient.Do(req)
+			if err == nil {
+				defer resp.Body.Close()
+				body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+				var cg map[string]map[string]float64
+				if json.Unmarshal(body, &cg) == nil {
+					if price, ok := cg[cgID]["usd"]; ok && price > 0 {
+						tokenPriceMu.Lock()
+						tokenPriceCache[lower] = price
+						tokenPriceCacheAt[lower] = time.Now()
+						tokenPriceMu.Unlock()
+						return price, nil
+					}
+				}
+			}
+		}
+	}
+
+	// On-chain fallback
+	fallback, err := e.onChainTokenPrice(ctx, quoteToken)
+	if err != nil {
+		return 0, fmt.Errorf("on-chain price fallback: %w", err)
+	}
+	tokenPriceMu.Lock()
+	tokenPriceCache[lower] = fallback
+	tokenPriceCacheAt[lower] = time.Now()
+	tokenPriceMu.Unlock()
+	return fallback, nil
+}
+
+// onChainTokenPrice reads the token/WBNB pair reserves to derive USD price.
+func (e *Engine) onChainTokenPrice(ctx context.Context, tokenAddr string) (float64, error) {
+	lower := strings.ToLower(tokenAddr)
+
+	refPair := ""
+	quoteIsToken0 := false
+
+	switch lower {
+	case strings.ToLower(CAKEAddr):
+		refPair = cakeWbnbPair
+		quoteIsToken0 = true // CAKE is token0 in CAKE/WBNB pair
+	case strings.ToLower(ETHAddr):
+		refPair = ethWbnbPair
+		quoteIsToken0 = true // ETH is token0 in ETH/WBNB pair
+	default:
+		return 0, fmt.Errorf("no reference pair for %s", tokenAddr)
+	}
+
+	pairAddr := common.HexToAddress(refPair)
 	data, err := e.pairABI.Pack("getReserves")
 	if err != nil {
 		return 0, err
 	}
-	result, err := e.rpc.CallContract(ctx, ethereum.CallMsg{To: &pairAddr, Data: data}, nil)
+	ctx2, cancel := context.WithTimeout(ctx, 1*time.Second)
+	defer cancel()
+	e.acquireRPC()
+	result, err := e.rpc.CallContract(ctx2, ethereum.CallMsg{To: &pairAddr, Data: data}, nil)
 	if err != nil {
-		return 0, fmt.Errorf("getReserves: %w", err)
+		return 0, err
 	}
-
 	type reserves struct {
 		Reserve0           *big.Int
 		Reserve1           *big.Int
 		BlockTimestampLast uint32
 	}
 	var res reserves
-	if err := e.pairABI.UnpackIntoInterface(&res, "getReserves", result); err != nil {
-		return 0, fmt.Errorf("unpack reserves: %w", err)
-	}
-	if res.Reserve0.Sign() == 0 && res.Reserve1.Sign() == 0 {
-		return 0, fmt.Errorf("zero reserves")
+	if err := e.pairABI.UnpackIntoInterface(&res, "getReserves", result); err != nil || res.Reserve0.Sign() == 0 || res.Reserve1.Sign() == 0 {
+		return 0, fmt.Errorf("bad reserves for ref pair %s", refPair)
 	}
 
-	e.acquireRPC()
-	data2, err := e.pairABI.Pack("token0")
-	if err != nil {
-		return 0, err
-	}
-	t0Result, err := e.rpc.CallContract(ctx, ethereum.CallMsg{To: &pairAddr, Data: data2}, nil)
-	if err != nil {
-		return 0, fmt.Errorf("token0 call: %w", err)
-	}
-	var token0Addr common.Address
-	if err := e.pairABI.UnpackIntoInterface(&token0Addr, "token0", t0Result); err != nil {
-		return 0, fmt.Errorf("unpack token0: %w", err)
-	}
-
-	wbnb := common.HexToAddress(WBNBAddr)
-	var bnbReserve *big.Int
-	if token0Addr == wbnb {
-		bnbReserve = res.Reserve0
+	// price in BNB = wbnbReserve / tokenReserve
+	var tokenRes, wbnbRes *big.Int
+	if quoteIsToken0 {
+		tokenRes = res.Reserve0
+		wbnbRes = res.Reserve1
 	} else {
-		bnbReserve = res.Reserve1
+		tokenRes = res.Reserve1
+		wbnbRes = res.Reserve0
 	}
+
+	tokenF, _ := new(big.Float).SetInt(tokenRes).Float64()
+	wbnbF, _ := new(big.Float).SetInt(wbnbRes).Float64()
+	priceInBNB := wbnbF / tokenF
 
 	bnbPrice := e.getBNBPrice(ctx)
-	bnbAmount, _ := new(big.Float).Quo(
-		new(big.Float).SetInt(bnbReserve),
-		new(big.Float).SetFloat64(1e18),
-	).Float64()
-	return bnbAmount * bnbPrice * 2, nil
+	return priceInBNB * bnbPrice, nil
 }
 
 func (e *Engine) getBNBPrice(ctx context.Context) float64 {
@@ -454,7 +629,6 @@ func (e *Engine) getBNBPrice(ctx context.Context) float64 {
 	}
 	bnbPriceMu.RUnlock()
 
-	// Try CoinGecko
 	reqCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(reqCtx, "GET",
@@ -483,21 +657,18 @@ func (e *Engine) getBNBPrice(ctx context.Context) float64 {
 	return e.fallbackBNBPrice(ctx)
 }
 
-// fallbackBNBPrice reads WBNB/USDT pair reserves on-chain.
 func (e *Engine) fallbackBNBPrice(ctx context.Context) float64 {
-	// PancakeSwap WBNB-USDT pair
-	const wbnbUsdtPair = "0x16b9a82891338f9bA80E2D6970FddA79D1eb0daE"
 	pairAddr := common.HexToAddress(wbnbUsdtPair)
 	data, err := e.pairABI.Pack("getReserves")
 	if err != nil {
-		return 300
+		return 600
 	}
 	ctx2, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	e.acquireRPC()
 	result, err := e.rpc.CallContract(ctx2, ethereum.CallMsg{To: &pairAddr, Data: data}, nil)
 	if err != nil {
-		return 300
+		return 600
 	}
 	type reserves struct {
 		Reserve0           *big.Int
@@ -506,18 +677,17 @@ func (e *Engine) fallbackBNBPrice(ctx context.Context) float64 {
 	}
 	var res reserves
 	if err := e.pairABI.UnpackIntoInterface(&res, "getReserves", result); err != nil {
-		return 300
+		return 600
 	}
-	// WBNB is token0, USDT (6 decimals) is token1
-	// price = usdt_reserve / wbnb_reserve * (1e18/1e6)
 	if res.Reserve0.Sign() == 0 {
-		return 300
+		return 600
 	}
+	// WBNB/USDT pair: both 18 decimals on BSC
 	usdtF, _ := new(big.Float).SetInt(res.Reserve1).Float64()
 	wbnbF, _ := new(big.Float).SetInt(res.Reserve0).Float64()
-	price := (usdtF / wbnbF) * 1e12 // adjust for decimal difference
+	price := usdtF / wbnbF
 	if price < 100 || price > 10000 {
-		return 300
+		return 600
 	}
 	bnbPriceMu.Lock()
 	cachedBNBPrice = price
@@ -525,6 +695,8 @@ func (e *Engine) fallbackBNBPrice(ctx context.Context) float64 {
 	bnbPriceMu.Unlock()
 	return price
 }
+
+// ─── Age check ────────────────────────────────────────────────────────────────
 
 func (e *Engine) getTokenAge(ctx context.Context, pairBlock uint64) (int64, error) {
 	e.acquireRPC()
@@ -535,8 +707,10 @@ func (e *Engine) getTokenAge(ctx context.Context, pairBlock uint64) (int64, erro
 	if current < pairBlock {
 		return 0, nil
 	}
-	return int64(current-pairBlock) * 3, nil // BSC ~3s block time
+	return int64(current-pairBlock) * 3, nil
 }
+
+// ─── Token info ───────────────────────────────────────────────────────────────
 
 type tokenInfoVal struct {
 	symbol   string
@@ -576,15 +750,28 @@ func (e *Engine) getTokenInfo(ctx context.Context, tokenAddress string) (tokenIn
 	return info, nil
 }
 
-// checkHoneypot simulates buy then sell via getAmountsOut.
-// Returns true if sell tax > 50% or sell simulation reverts.
-func (e *Engine) checkHoneypot(ctx context.Context, tokenAddress, pairAddress string) (bool, error) {
+// ─── Honeypot simulation ──────────────────────────────────────────────────────
+
+// checkHoneypot simulates buy then sell. The path uses the actual quote token
+// so we accurately test the route the executor will use.
+func (e *Engine) checkHoneypot(ctx context.Context, tokenAddress, pairAddress, quoteToken string) (bool, error) {
 	routerAddr := common.HexToAddress(RouterAddress)
 	tokenAddr := common.HexToAddress(tokenAddress)
 	wbnbAddr := common.HexToAddress(WBNBAddr)
+	quoteAddr := common.HexToAddress(quoteToken)
 
 	testAmountIn := big.NewInt(1e15) // 0.001 BNB
-	buyPath := []common.Address{wbnbAddr, tokenAddr}
+
+	// Build paths matching the actual executor route
+	isWBNB := strings.EqualFold(quoteToken, WBNBAddr)
+	var buyPath, sellPath []common.Address
+	if isWBNB {
+		buyPath = []common.Address{wbnbAddr, tokenAddr}
+		sellPath = []common.Address{tokenAddr, wbnbAddr}
+	} else {
+		buyPath = []common.Address{wbnbAddr, quoteAddr, tokenAddr}
+		sellPath = []common.Address{tokenAddr, quoteAddr, wbnbAddr}
+	}
 
 	buyData, err := e.routerABI.Pack("getAmountsOut", testAmountIn, buyPath)
 	if err != nil {
@@ -593,20 +780,17 @@ func (e *Engine) checkHoneypot(ctx context.Context, tokenAddress, pairAddress st
 	e.acquireRPC()
 	buyResult, err := e.rpc.CallContract(ctx, ethereum.CallMsg{To: &routerAddr, Data: buyData}, nil)
 	if err != nil {
-		// Router call failed — could be new pair not yet in AMM
-		return false, nil
+		return false, nil // no direct route yet — not necessarily honeypot
 	}
 	var buyAmounts []*big.Int
 	if err := e.routerABI.UnpackIntoInterface(&buyAmounts, "getAmountsOut", buyResult); err != nil {
 		return true, nil
 	}
-	if len(buyAmounts) < 2 || buyAmounts[1].Sign() == 0 {
+	if len(buyAmounts) < 2 || buyAmounts[len(buyAmounts)-1].Sign() == 0 {
 		return true, nil
 	}
-	tokensReceived := buyAmounts[1]
+	tokensReceived := buyAmounts[len(buyAmounts)-1]
 
-	// Simulate sell
-	sellPath := []common.Address{tokenAddr, wbnbAddr}
 	sellData, err := e.routerABI.Pack("getAmountsOut", tokensReceived, sellPath)
 	if err != nil {
 		return false, nil
@@ -614,19 +798,18 @@ func (e *Engine) checkHoneypot(ctx context.Context, tokenAddress, pairAddress st
 	e.acquireRPC()
 	sellResult, err := e.rpc.CallContract(ctx, ethereum.CallMsg{To: &routerAddr, Data: sellData}, nil)
 	if err != nil {
-		// Sell reverts → honeypot
-		return true, nil
+		return true, nil // sell reverts → honeypot
 	}
 	var sellAmounts []*big.Int
 	if err := e.routerABI.UnpackIntoInterface(&sellAmounts, "getAmountsOut", sellResult); err != nil {
 		return true, nil
 	}
-	if len(sellAmounts) < 2 || sellAmounts[1].Sign() == 0 {
+	if len(sellAmounts) < 2 || sellAmounts[len(sellAmounts)-1].Sign() == 0 {
 		return true, nil
 	}
 
-	// Effective tax = 1 - (bnbBack / bnbIn)
-	bnbBack := new(big.Float).SetInt(sellAmounts[1])
+	// Effective round-trip: bnbBack / bnbIn
+	bnbBack := new(big.Float).SetInt(sellAmounts[len(sellAmounts)-1])
 	bnbIn := new(big.Float).SetInt(testAmountIn)
 	ratio, _ := new(big.Float).Quo(bnbBack, bnbIn).Float64()
 	if ratio < 0.5 {
@@ -634,6 +817,8 @@ func (e *Engine) checkHoneypot(ctx context.Context, tokenAddress, pairAddress st
 	}
 	return false, nil
 }
+
+// ─── BSCscan data ─────────────────────────────────────────────────────────────
 
 func (e *Engine) getBSCscanData(ctx context.Context, tokenAddress string) (holderCount int, top10Pct float64, rugScore int) {
 	reqCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -660,8 +845,8 @@ func (e *Engine) getBSCscanData(ctx context.Context, tokenAddress string) (holde
 		TokenHolderQuantity string `json:"TokenHolderQuantity"`
 	}
 	var result struct {
-		Status  string   `json:"status"`
-		Result  []holder `json:"result"`
+		Status string   `json:"status"`
+		Result []holder `json:"result"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
 		return
@@ -674,4 +859,43 @@ func (e *Engine) getBSCscanData(ctx context.Context, tokenAddress string) (holde
 		rugScore++
 	}
 	return
+}
+
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+func isQuoteToken(addrLower string) bool {
+	switch addrLower {
+	case wbnbAddrLower,
+		strings.ToLower(USDTAddr),
+		strings.ToLower(BUSDAddr),
+		strings.ToLower(USDCAddr),
+		strings.ToLower(ETHAddr),
+		strings.ToLower(CAKEAddr):
+		return true
+	}
+	return false
+}
+
+func quoteSymbolFor(addr string) string {
+	switch strings.ToLower(addr) {
+	case wbnbAddrLower:
+		return "WBNB"
+	case strings.ToLower(USDTAddr):
+		return "USDT"
+	case strings.ToLower(BUSDAddr):
+		return "BUSD"
+	case strings.ToLower(USDCAddr):
+		return "USDC"
+	case strings.ToLower(ETHAddr):
+		return "ETH"
+	case strings.ToLower(CAKEAddr):
+		return "CAKE"
+	}
+	return "UNKNOWN"
+}
+
+// quoteTokenDecimals returns the big.Float divisor (10^decimals) for a quote token.
+// All whitelisted tokens on BSC use 18 decimals.
+func quoteTokenDecimals(_ string) float64 {
+	return 1e18
 }

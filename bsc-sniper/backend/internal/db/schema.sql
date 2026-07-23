@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS positions (
     token_address   VARCHAR(42) NOT NULL UNIQUE,
     pair_address    VARCHAR(42),
     token_symbol    VARCHAR(64),
+    quote_token     VARCHAR(42) DEFAULT '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c',
     entry_price_bnb NUMERIC(30,18) NOT NULL,
     current_price_bnb NUMERIC(30,18),
     ath_price_bnb   NUMERIC(30,18),

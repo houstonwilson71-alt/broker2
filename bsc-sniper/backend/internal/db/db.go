@@ -203,6 +203,7 @@ type Position struct {
 	TokenAddress     string
 	PairAddress      string
 	TokenSymbol      string
+	QuoteToken       string // canonical-case address of the quote token
 	EntryPriceBNB    string
 	CurrentPriceBNB  string
 	ATHPriceBNB      string
@@ -216,11 +217,15 @@ type Position struct {
 }
 
 func (d *DB) UpsertPosition(ctx context.Context, p *Position) error {
+	qt := p.QuoteToken
+	if qt == "" {
+		qt = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c" // default WBNB
+	}
 	_, err := d.Pool.Exec(ctx, `
 		INSERT INTO positions
-		  (token_address, pair_address, token_symbol, entry_price_bnb, current_price_bnb,
+		  (token_address, pair_address, token_symbol, quote_token, entry_price_bnb, current_price_bnb,
 		   ath_price_bnb, amount_tokens, cost_bnb, realized_pnl_bnb, tp1_triggered, status, closed_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
 		ON CONFLICT (token_address) DO UPDATE SET
 		  current_price_bnb=EXCLUDED.current_price_bnb,
 		  ath_price_bnb=EXCLUDED.ath_price_bnb,
@@ -230,15 +235,16 @@ func (d *DB) UpsertPosition(ctx context.Context, p *Position) error {
 		  status=EXCLUDED.status,
 		  closed_at=EXCLUDED.closed_at,
 		  cost_bnb=EXCLUDED.cost_bnb
-	`, p.TokenAddress, p.PairAddress, p.TokenSymbol, p.EntryPriceBNB, p.CurrentPriceBNB,
+	`, p.TokenAddress, p.PairAddress, p.TokenSymbol, qt, p.EntryPriceBNB, p.CurrentPriceBNB,
 		p.ATHPriceBNB, p.AmountTokens, p.CostBNB, p.RealizedPnlBNB, p.TP1Triggered, p.Status, p.ClosedAt)
 	return err
 }
 
 func (d *DB) ListPositions(ctx context.Context, status string) ([]*Position, error) {
 	query := `
-		SELECT id, token_address, pair_address, token_symbol, entry_price_bnb,
-		       current_price_bnb, ath_price_bnb, amount_tokens, cost_bnb,
+		SELECT id, token_address, pair_address, token_symbol,
+		       COALESCE(quote_token, '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095b'),
+		       entry_price_bnb, current_price_bnb, ath_price_bnb, amount_tokens, cost_bnb,
 		       realized_pnl_bnb, tp1_triggered, status, opened_at, closed_at
 		FROM positions`
 	args := []interface{}{}
@@ -258,6 +264,7 @@ func (d *DB) ListPositions(ctx context.Context, status string) ([]*Position, err
 	for rows.Next() {
 		p := &Position{}
 		if err := rows.Scan(&p.ID, &p.TokenAddress, &p.PairAddress, &p.TokenSymbol,
+			&p.QuoteToken,
 			&p.EntryPriceBNB, &p.CurrentPriceBNB, &p.ATHPriceBNB, &p.AmountTokens,
 			&p.CostBNB, &p.RealizedPnlBNB, &p.TP1Triggered, &p.Status,
 			&p.OpenedAt, &p.ClosedAt); err != nil {

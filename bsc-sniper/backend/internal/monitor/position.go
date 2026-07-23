@@ -23,7 +23,12 @@ const pairReservesABIJSON = `[
   {"inputs":[],"name":"token0","outputs":[{"internalType":"address","name":"","type":"address"}],"stateMutability":"view","type":"function"}
 ]`
 
-const WBNBAddr = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095b"
+const (
+	WBNBAddr    = "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c"
+	wbnbLower   = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"
+	// WBNB/USDT pair for BNB price fallback
+	wbnbUsdtRef = "0x16b9a82891338f9bA80E2D6970FddA79D1eb0daE"
+)
 
 // Seller is a subset of the executor used by monitor to trigger sells.
 type Seller interface {
@@ -172,7 +177,7 @@ func (m *Monitor) tick(ctx context.Context) {
 		pos := state.pos
 		m.mu.RUnlock()
 
-		price, err := m.getCurrentPrice(ctx, pos.PairAddress, pos.TokenAddress)
+		price, err := m.getCurrentPrice(ctx, pos.PairAddress, pos.TokenAddress, pos.QuoteToken)
 		if err != nil {
 			continue
 		}
@@ -283,7 +288,10 @@ func (m *Monitor) tick(ctx context.Context) {
 	}
 }
 
-func (m *Monitor) getCurrentPrice(ctx context.Context, pairAddress, tokenAddress string) (float64, error) {
+// getCurrentPrice returns the token price denominated in BNB.
+// For WBNB-paired pools this is direct. For stablecoin/other pools it
+// converts via the BNB price so all positions use the same unit.
+func (m *Monitor) getCurrentPrice(ctx context.Context, pairAddress, tokenAddress, quoteToken string) (float64, error) {
 	pairAddr := common.HexToAddress(pairAddress)
 	priceCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
@@ -323,27 +331,76 @@ func (m *Monitor) getCurrentPrice(ctx context.Context, pairAddress, tokenAddress
 	wbnb := common.HexToAddress(WBNBAddr)
 	token := common.HexToAddress(tokenAddress)
 
-	var bnbReserve, tokenReserve *big.Int
-	if token0Addr == wbnb {
-		bnbReserve = res.Reserve0
+	// Determine which reserve is which
+	var quoteReserve, tokenReserve *big.Int
+	quoteAddr := wbnb
+	if quoteToken != "" && !strings.EqualFold(quoteToken, WBNBAddr) {
+		quoteAddr = common.HexToAddress(quoteToken)
+	}
+
+	if token0Addr == quoteAddr {
+		quoteReserve = res.Reserve0
 		tokenReserve = res.Reserve1
 	} else if token0Addr == token {
 		tokenReserve = res.Reserve0
-		bnbReserve = res.Reserve1
+		quoteReserve = res.Reserve1
 	} else {
 		return 0, nil
 	}
 
-	if tokenReserve == nil || tokenReserve.Sign() == 0 {
+	if tokenReserve == nil || tokenReserve.Sign() == 0 || quoteReserve == nil || quoteReserve.Sign() == 0 {
 		return 0, nil
 	}
 
-	price, _ := new(big.Float).Quo(
-		new(big.Float).SetInt(bnbReserve),
+	// price in quote-token units per meme token
+	priceInQuote, _ := new(big.Float).Quo(
+		new(big.Float).SetInt(quoteReserve),
 		new(big.Float).SetInt(tokenReserve),
 	).Float64()
 
-	return price, nil
+	// Convert to BNB if the quote token is not WBNB
+	if strings.EqualFold(quoteToken, WBNBAddr) || quoteToken == "" {
+		return priceInQuote, nil
+	}
+
+	// For stablecoins: price_in_BNB = price_in_USD / BNB_price_USD
+	bnbPrice := m.getBNBPrice(ctx)
+	if bnbPrice <= 0 {
+		return 0, nil
+	}
+	return priceInQuote / bnbPrice, nil
+}
+
+// getBNBPrice fetches BNB/USD price from the WBNB/USDT reference pair.
+func (m *Monitor) getBNBPrice(ctx context.Context) float64 {
+	pairAddr := common.HexToAddress(wbnbUsdtRef)
+	pCtx, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+	defer cancel()
+	data, err := m.pairABI.Pack("getReserves")
+	if err != nil {
+		return 600
+	}
+	result, err := m.rpc.CallContract(pCtx, ethereum.CallMsg{To: &pairAddr, Data: data}, nil)
+	if err != nil {
+		return 600
+	}
+	type reserves struct {
+		Reserve0           *big.Int
+		Reserve1           *big.Int
+		BlockTimestampLast uint32
+	}
+	var res reserves
+	if err := m.pairABI.UnpackIntoInterface(&res, "getReserves", result); err != nil || res.Reserve0.Sign() == 0 {
+		return 600
+	}
+	// WBNB is token0, USDT is token1 — both 18 decimals on BSC
+	usdtF, _ := new(big.Float).SetInt(res.Reserve1).Float64()
+	wbnbF, _ := new(big.Float).SetInt(res.Reserve0).Float64()
+	price := usdtF / wbnbF
+	if price < 100 || price > 10000 {
+		return 600
+	}
+	return price
 }
 
 func (m *Monitor) GetPositions() []*positionState {
