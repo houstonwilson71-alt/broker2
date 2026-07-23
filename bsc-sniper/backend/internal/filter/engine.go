@@ -47,8 +47,8 @@ const (
 	wbnbAddrLower = "0xbb4cdb9cbd36b01bd1cbaebf2de08d9173bc095c"
 
 	// Elite safeguards
-	eliteLiquidityFloorUSD = 12000.0 // $12k minimum pool liquidity for this test
-	eliteMinRoundTripRatio = 0.95    // bnb back / bnb in; reject if efficiency < 95%
+	eliteLiquidityFloorUSD = 8000.0 // $8k minimum pool liquidity for this test
+	eliteMinRoundTripRatio = 0.90   // bnb back / bnb in; reject if efficiency < 90%
 
 	// Stablecoin addresses (BSC, all 18 decimals)
 	USDTAddr = "0x55d398326f99059fF775485246999027B3197955"
