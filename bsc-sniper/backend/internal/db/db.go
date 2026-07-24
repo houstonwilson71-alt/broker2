@@ -196,6 +196,30 @@ func (d *DB) ListTrades(ctx context.Context, limit int) ([]*Trade, error) {
 	return trades, rows.Err()
 }
 
+func (d *DB) ListTradesByToken(ctx context.Context, tokenAddress string) ([]*Trade, error) {
+	rows, err := d.Pool.Query(ctx, `
+		SELECT id, token_address, pair_address, side, amount_bnb, amount_tokens,
+		       price_bnb, tx_hash, gas_used, gas_price_gwei, status, error_msg, executed_at
+		FROM trades WHERE token_address = $1 ORDER BY executed_at DESC
+	`, tokenAddress)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var trades []*Trade
+	for rows.Next() {
+		t := &Trade{}
+		if err := rows.Scan(&t.ID, &t.TokenAddress, &t.PairAddress, &t.Side,
+			&t.AmountBNB, &t.AmountTokens, &t.PriceBNB, &t.TxHash, &t.GasUsed,
+			&t.GasPriceGwei, &t.Status, &t.ErrorMsg, &t.ExecutedAt); err != nil {
+			return nil, err
+		}
+		trades = append(trades, t)
+	}
+	return trades, rows.Err()
+}
+
 // ---- Position ----
 
 type Position struct {
@@ -252,6 +276,14 @@ func (d *DB) CountRecentPositionsBySymbol(ctx context.Context, symbol string, wi
 }
 
 func (d *DB) ListPositions(ctx context.Context, status string) ([]*Position, error) {
+	statuses := []string{}
+	if status != "" {
+		statuses = append(statuses, status)
+	}
+	return d.ListPositionsByStatuses(ctx, statuses)
+}
+
+func (d *DB) ListPositionsByStatuses(ctx context.Context, statuses []string) ([]*Position, error) {
 	query := `
 		SELECT id, token_address, pair_address, token_symbol,
 		       COALESCE(quote_token, '0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095b'),
@@ -259,9 +291,9 @@ func (d *DB) ListPositions(ctx context.Context, status string) ([]*Position, err
 		       realized_pnl_bnb, tp1_triggered, tp2_done, status, opened_at, closed_at
 		FROM positions`
 	args := []interface{}{}
-	if status != "" {
-		query += " WHERE status=$1"
-		args = append(args, status)
+	if len(statuses) > 0 {
+		query += " WHERE status = ANY($1)"
+		args = append(args, statuses)
 	}
 	query += " ORDER BY opened_at DESC"
 

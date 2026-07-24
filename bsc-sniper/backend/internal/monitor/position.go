@@ -79,7 +79,7 @@ func New(cfg *config.Config, rpc *ethclient.Client, redis *redisclient.Client,
 }
 
 func (m *Monitor) LoadFromDB(ctx context.Context) error {
-	positions, err := m.db.ListPositions(ctx, "open")
+	positions, err := m.db.ListPositionsByStatuses(ctx, []string{"bought", "partial"})
 	if err != nil {
 		return err
 	}
@@ -138,11 +138,11 @@ func (m *Monitor) Run(ctx context.Context) {
 	}
 }
 
-// reloadNewPositions periodically queries the DB for open positions that are
-// not yet tracked in memory. This catches positions created by the executor
+// reloadNewPositions periodically queries the DB for bought/partial positions that
+// are not yet tracked in memory. This catches positions created by the executor
 // after the monitor started.
 func (m *Monitor) reloadNewPositions(ctx context.Context) {
-	positions, err := m.db.ListPositions(ctx, "open")
+	positions, err := m.db.ListPositionsByStatuses(ctx, []string{"bought", "partial"})
 	if err != nil {
 		m.logger.Warn("reload positions from DB", zap.Error(err))
 		return

@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -172,6 +173,9 @@ func (b *Bot) Stop() error {
 	b.stateStr.Store(stateIdle)
 	b.mu.Unlock()
 
+	// Print and persist the unsold token board after force sells have attempted.
+	b.printUnsoldTokenBoard()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := b.database.SetBotRunning(ctx, false); err != nil {
@@ -182,6 +186,57 @@ func (b *Bot) Stop() error {
 	return nil
 }
 
+// printUnsoldTokenBoard queries positions that are still bought or unsellable,
+// prints a console table, and writes contract addresses to unsold_tokens.txt.
+func (b *Bot) printUnsoldTokenBoard() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	positions, err := b.database.ListPositionsByStatuses(ctx, []string{"bought", "unsellable"})
+	if err != nil {
+		b.logger.Error("query unsold positions", zap.Error(err))
+		return
+	}
+	if len(positions) == 0 {
+		b.logger.Info("unsold token board: no leftover positions")
+		return
+	}
+
+	var lines []string
+	lines = append(lines, "\n═══════════ UNSOLD TOKEN BOARD ═══════════")
+	lines = append(lines, fmt.Sprintf("%-12s | %-42s | %-66s | %-24s | %-12s", "Symbol", "Contract", "Buy Tx", "Amount", "Status"))
+	lines = append(lines, strings.Repeat("-", 165))
+	for _, p := range positions {
+		buyTx := "unknown"
+		trades, err := b.database.ListTradesByToken(ctx, p.TokenAddress)
+		if err == nil {
+			for _, t := range trades {
+				if t.Side == "buy" && t.Status == "confirmed" {
+					buyTx = t.TxHash
+					break
+				}
+			}
+		}
+		lines = append(lines, fmt.Sprintf("%-12s | %-42s | %-66s | %-24s | %-12s",
+			p.TokenSymbol, p.TokenAddress, buyTx, p.AmountTokens, p.Status))
+	}
+	lines = append(lines, "═══════════════════════════════════════════")
+	board := strings.Join(lines, "\n")
+	fmt.Println(board)
+	b.logger.Info(board)
+
+	// Write contract addresses to unsold_tokens.txt, one per line.
+	var addrs []string
+	for _, p := range positions {
+		addrs = append(addrs, p.TokenAddress)
+	}
+	if err := os.WriteFile("unsold_tokens.txt", []byte(strings.Join(addrs, "\n")+"\n"), 0644); err != nil {
+		b.logger.Error("write unsold_tokens.txt", zap.Error(err))
+	} else {
+		b.logger.Info("wrote unsold_tokens.txt", zap.Int("count", len(addrs)))
+	}
+}
+
 // EmergencyStop sells all open positions immediately then stops the bot.
 func (b *Bot) EmergencyStop(ctx context.Context) error {
 	b.logger.Warn("⚠️  EMERGENCY STOP — selling all positions")
@@ -189,7 +244,7 @@ func (b *Bot) EmergencyStop(ctx context.Context) error {
 	sellCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 
-	positions, err := b.database.ListPositions(sellCtx, "open")
+	positions, err := b.database.ListPositionsByStatuses(sellCtx, []string{"bought", "partial"})
 	if err != nil {
 		b.logger.Error("list positions for emergency sell", zap.Error(err))
 	} else {

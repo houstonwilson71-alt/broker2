@@ -338,11 +338,10 @@ func (ex *Executor) executeBuy(ctx context.Context, tok *filter.ApprovedToken, i
 	}
 
 	slippage := ex.cfg.SlippageBPS
-	gasMultiplier := int64(15) // 1.5x
+	gasMultiplier := int64(15) // 1.5x default
 	if isRetry {
-		slippage *= 2
-		gasMultiplier = 30
-		ex.logger.Info("retrying buy", zap.String("token", tok.TokenAddress))
+		gasMultiplier = 20 // 2.0x retry
+		ex.logger.Info("retrying buy with 2.0x gas", zap.String("token", tok.TokenAddress))
 	}
 
 	txCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
@@ -372,7 +371,6 @@ func (ex *Executor) executeBuy(ctx context.Context, tok *filter.ApprovedToken, i
 	if err != nil {
 		ex.logger.Error("getAmountsOut", zap.Error(err))
 		if !isRetry {
-			time.Sleep(200 * time.Millisecond)
 			ex.executeBuy(ctx, tok, true)
 		}
 		return
@@ -477,7 +475,6 @@ func (ex *Executor) executeBuy(ctx context.Context, tok *filter.ApprovedToken, i
 		}
 		ex.circuit.recordFailure()
 		if !isRetry {
-			time.Sleep(200 * time.Millisecond)
 			ex.executeBuy(ctx, tok, true)
 		}
 		return
@@ -534,7 +531,7 @@ func (ex *Executor) executeBuy(ctx context.Context, tok *filter.ApprovedToken, i
 		ATHPriceBNB:     entryPriceStr,
 		AmountTokens:    expectedOut.String(),
 		CostBNB:         ex.cfg.BuyAmountBNB,
-		Status:          "open",
+		Status:          "bought",
 	}
 	if dbErr := ex.db.UpsertPosition(ctx, position); dbErr != nil {
 		ex.logger.Error("upsert position", zap.Error(dbErr))
@@ -547,6 +544,109 @@ func (ex *Executor) executeBuy(ctx context.Context, tok *filter.ApprovedToken, i
 		"tx_hash":  signedTx.Hash().Hex(),
 		"position": position,
 	})
+
+	// Post-buy verification: immediately simulate selling 100% of received tokens.
+	// If the sell would revert or return <90% of the BNB spent, try an emergency sell
+	// with 50% slippage and 2.0x gas. If that fails, mark the position as unsellable.
+	ex.postBuyVerification(ctx, position, signedTx.Hash().Hex())
+}
+
+// postBuyVerification simulates a full sell of the just-bought position and,
+// if the round-trip is bad, attempts an emergency dump.
+func (ex *Executor) postBuyVerification(ctx context.Context, pos *db.Position, buyTxHash string) {
+	tokenAddr := common.HexToAddress(pos.TokenAddress)
+	routerAddr := common.HexToAddress(RouterAddr)
+	sellPath := buildSellPath(pos.QuoteToken, tokenAddr)
+
+	// Read actual token balance received.
+	balData, err := ex.erc20ABI.Pack("balanceOf", ex.fromAddr)
+	if err != nil {
+		ex.logger.Error("postbuy pack balanceOf", zap.Error(err), zap.String("token", pos.TokenAddress))
+		return
+	}
+	ex.acquireRPC()
+	balResult, err := ex.rpc.CallContract(ctx, ethereum.CallMsg{To: &tokenAddr, Data: balData}, nil)
+	if err != nil {
+		ex.logger.Error("postbuy balanceOf", zap.Error(err), zap.String("token", pos.TokenAddress))
+		return
+	}
+	var bal *big.Int
+	if err := ex.erc20ABI.UnpackIntoInterface(&bal, "balanceOf", balResult); err != nil {
+		ex.logger.Error("postbuy unpack balanceOf", zap.Error(err), zap.String("token", pos.TokenAddress))
+		return
+	}
+	if bal == nil || bal.Sign() == 0 {
+		ex.logger.Warn("postbuy zero balance", zap.String("token", pos.TokenAddress))
+		return
+	}
+
+	amountsData, err := ex.routerABI.Pack("getAmountsOut", bal, sellPath)
+	if err != nil {
+		ex.logger.Error("postbuy pack getAmountsOut", zap.Error(err), zap.String("token", pos.TokenAddress))
+		return
+	}
+	ex.acquireRPC()
+	amountsResult, err := ex.rpc.CallContract(ctx, ethereum.CallMsg{To: &routerAddr, Data: amountsData}, nil)
+	if err != nil {
+		ex.logger.Warn("postbuy sell simulation reverted",
+			zap.Error(err),
+			zap.String("token", pos.TokenAddress),
+			zap.String("symbol", pos.TokenSymbol),
+		)
+		ex.tryEmergencyDump(ctx, pos, bal, buyTxHash)
+		return
+	}
+	var amounts []*big.Int
+	if err := ex.routerABI.UnpackIntoInterface(&amounts, "getAmountsOut", amountsResult); err != nil || len(amounts) < 2 {
+		ex.logger.Warn("postbuy sell simulation unpack failed",
+			zap.Error(err),
+			zap.String("token", pos.TokenAddress),
+		)
+		ex.tryEmergencyDump(ctx, pos, bal, buyTxHash)
+		return
+	}
+	bnbBack := amounts[len(amounts)-1]
+	bnbIn := toWei(ex.cfg.BuyAmountBNB)
+	efficiency, _ := new(big.Float).Quo(
+		new(big.Float).SetInt(bnbBack),
+		new(big.Float).SetInt(bnbIn),
+	).Float64()
+
+	ex.logger.Info("postbuy sell simulation",
+		zap.String("token", pos.TokenAddress),
+		zap.String("symbol", pos.TokenSymbol),
+		zap.Float64("efficiency", efficiency),
+	)
+
+	if efficiency < 0.90 {
+		ex.logger.Warn("postbuy efficiency below 0.90 — emergency dumping",
+			zap.String("token", pos.TokenAddress),
+			zap.String("symbol", pos.TokenSymbol),
+			zap.Float64("efficiency", efficiency),
+		)
+		ex.tryEmergencyDump(ctx, pos, bal, buyTxHash)
+	}
+}
+
+// tryEmergencyDump attempts to sell 100% of the position with 50% slippage and 2.0x gas.
+// If the dump fails, the position is marked as unsellable.
+func (ex *Executor) tryEmergencyDump(ctx context.Context, pos *db.Position, amount *big.Int, buyTxHash string) {
+	if err := ex.ExecuteSellCustom(ctx, pos, 100, "unsellable_dump", 5000, 20); err != nil {
+		ex.logger.Error("emergency dump failed — marking unsellable",
+			zap.Error(err),
+			zap.String("token", pos.TokenAddress),
+			zap.String("symbol", pos.TokenSymbol),
+		)
+		pos.Status = "unsellable"
+		if dbErr := ex.db.UpsertPosition(ctx, pos); dbErr != nil {
+			ex.logger.Error("mark unsellable failed", zap.Error(dbErr), zap.String("token", pos.TokenAddress))
+		}
+		return
+	}
+	ex.logger.Info("emergency dump succeeded",
+		zap.String("token", pos.TokenAddress),
+		zap.String("symbol", pos.TokenSymbol),
+	)
 }
 
 // dualSubmit sends to public RPC and optionally BloxRoute concurrently.
@@ -579,9 +679,21 @@ func (ex *Executor) dualSubmit(ctx context.Context, tx *types.Transaction) error
 	return lastErr
 }
 
-// ExecuteSell sells pct% of the position using the correct reverse path.
+// ExecuteSell sells pct% of the position using the correct reverse path with
+// the standard 5% slippage and 1.5x gas (plus extra boost for TP exits).
 // sellType is "tp_50", "tp_300", "trailing_sl", "breakeven_sl", "breakeven_sl_partial", or "force".
 func (ex *Executor) ExecuteSell(ctx context.Context, pos *db.Position, pct int, sellType string) error {
+	gasMultiplier := int64(15)
+	if strings.HasPrefix(sellType, "tp_") || sellType == "trailing_sl" {
+		gasMultiplier = 225 // 1.5x * 1.5x = 2.25x for TP sells
+	}
+	return ex.ExecuteSellCustom(ctx, pos, pct, sellType, 500, gasMultiplier)
+}
+
+// ExecuteSellCustom sells pct% of the position with configurable slippage (basis
+// points) and gas multiplier (times 10; e.g. 15 = 1.5x). Used by the standard monitor
+// exits and by the post-buy emergency dump.
+func (ex *Executor) ExecuteSellCustom(ctx context.Context, pos *db.Position, pct int, sellType string, slippageBps int, gasMultiplier int64) error {
 	if !ex.cfg.LiveTradingEnabled {
 		ex.logger.Info("SIMULATED SELL",
 			zap.String("token", pos.TokenAddress),
@@ -639,8 +751,8 @@ func (ex *Executor) ExecuteSell(ctx context.Context, pos *db.Position, pct int, 
 		return fmt.Errorf("unpack sell amounts: %w", err)
 	}
 	expectedBNB := amounts[len(amounts)-1]
-	// Strict slippage protection: allow only 5% output slippage on every sell.
-	amountOutMin := new(big.Int).Mul(expectedBNB, big.NewInt(9500))
+	// Slippage protection: amountOutMin = expected * (10000 - slippageBps) / 10000
+	amountOutMin := new(big.Int).Mul(expectedBNB, big.NewInt(int64(10000-slippageBps)))
 	amountOutMin.Div(amountOutMin, big.NewInt(10000))
 
 	deadline := big.NewInt(time.Now().Add(2 * time.Minute).Unix())
@@ -663,13 +775,8 @@ func (ex *Executor) ExecuteSell(ctx context.Context, pos *db.Position, pct int, 
 	if err != nil {
 		return fmt.Errorf("gas price: %w", err)
 	}
-	gasPrice := new(big.Int).Mul(suggestedGasPrice, big.NewInt(15))
+	gasPrice := new(big.Int).Mul(suggestedGasPrice, big.NewInt(gasMultiplier))
 	gasPrice.Div(gasPrice, big.NewInt(10))
-	// Gas boost for take-profit sells to beat front-runners.
-	if strings.HasPrefix(sellType, "tp_") || sellType == "trailing_sl" {
-		gasPrice = new(big.Int).Mul(gasPrice, big.NewInt(15))
-		gasPrice.Div(gasPrice, big.NewInt(10))
-	}
 
 	defaultGasLimit := uint64(300000)
 	if len(sellPath) > 2 {
@@ -743,7 +850,10 @@ func (ex *Executor) ExecuteSell(ctx context.Context, pos *db.Position, pct int, 
 			)
 		}
 		if attempt == 1 {
-			return fmt.Errorf("send sell failed after retry: %s", sendErr)
+			if sendErr != nil {
+				return fmt.Errorf("send sell failed after retry: %w", sendErr)
+			}
+			return fmt.Errorf("sell tx failed after retry (reverted or receipt not found)")
 		}
 	}
 

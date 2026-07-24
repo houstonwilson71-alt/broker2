@@ -458,10 +458,7 @@ func (e *Engine) processEvent(ctx context.Context, event *listener.NewPairEvent)
 
 // getLiquidityUSD returns total liquidity in USD for any supported quote token.
 // Uses balanceOf(pool) on the quote ERC-20 — works for V2, V3, and StableSwap pools.
-//
-// Test rule: check immediately. If liquidity is below the floor, wait 3 seconds and
-// check again. If it is still below the floor, reject. This lets pairs that receive
-// liquidity right after creation pass without letting low-liquidity pairs through.
+// Ultra-low-latency path: check exactly once and proceed. No retries, no sleeps.
 func (e *Engine) getLiquidityUSD(ctx context.Context, pairAddress, memeToken, quoteToken string) (float64, error) {
 	liq, err := e.checkLiquidityOnce(ctx, pairAddress, quoteToken)
 	if err != nil {
@@ -471,23 +468,8 @@ func (e *Engine) getLiquidityUSD(ctx context.Context, pairAddress, memeToken, qu
 	if eliteLiquidityFloorUSD > floor {
 		floor = eliteLiquidityFloorUSD
 	}
-	if liq >= floor {
-		return liq, nil
-	}
-
-	// First reading was below floor — wait 3 seconds and retry once.
-	select {
-	case <-ctx.Done():
-		return 0, ctx.Err()
-	case <-time.After(3 * time.Second):
-	}
-
-	liq, err = e.checkLiquidityOnce(ctx, pairAddress, quoteToken)
-	if err != nil {
-		return 0, err
-	}
 	if liq < floor {
-		return liq, fmt.Errorf("liquidity below $%.0f after 3s retry: $%.0f", floor, liq)
+		return liq, fmt.Errorf("liquidity below $%.0f: $%.0f", floor, liq)
 	}
 	return liq, nil
 }

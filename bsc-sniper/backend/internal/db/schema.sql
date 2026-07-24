@@ -67,13 +67,17 @@ CREATE TABLE IF NOT EXISTS positions (
     realized_pnl_bnb NUMERIC(20,8) DEFAULT 0,
     tp1_triggered   BOOLEAN DEFAULT FALSE,
     tp2_done        BOOLEAN DEFAULT FALSE,
-    status          VARCHAR(16) DEFAULT 'open' CHECK (status IN ('open','closed','partial')),
+    status          VARCHAR(16) DEFAULT 'open' CHECK (status IN ('open','closed','partial','bought','unsellable')),
     opened_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     closed_at       TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS idx_positions_status ON positions(status, opened_at DESC);
 CREATE INDEX IF NOT EXISTS idx_positions_token ON positions(token_address);
+
+-- Migration: allow 'bought' and 'unsellable' statuses for ultra-low-latency test.
+ALTER TABLE positions DROP CONSTRAINT IF EXISTS positions_status_check;
+ALTER TABLE positions ADD CONSTRAINT positions_status_check CHECK (status IN ('open','closed','partial','bought','unsellable'));
 
 CREATE TABLE IF NOT EXISTS bot_state (
     id          INT PRIMARY KEY DEFAULT 1,

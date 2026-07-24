@@ -1,6 +1,7 @@
 package listener
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"math/big"
@@ -12,7 +13,9 @@ import (
 	"github.com/ethereum/go-ethereum/accounts/abi"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/ethereum/go-ethereum/rpc"
 	redisclient "github.com/bsc-sniper/backend/internal/redis"
 	"go.uber.org/zap"
 )
@@ -24,6 +27,9 @@ const (
 	FactoryV3     = "0x0BFbCF9fa4f9C56B0F40a671Ad40E0805A091865"
 	FactoryStable = "0x25a55f9f2279A54951133D503490342b50E5cd15"
 )
+
+// PancakeSwap V2 pair init code hash (used for CREATE2 pair-address computation).
+const v2InitCodeHash = "0x00fb7f630766e6a796048ea87d01c7c0f0b3f5646fed5b9468a5a3c9a25c61e3"
 
 // quoteTokens maps lowercase BSC addresses to their symbol.
 // A pair is accepted if exactly one token is in this whitelist;
@@ -37,13 +43,15 @@ var quoteTokens = map[string]string{
 	"0x0e09fabb73bd3ade0a17ecc321fd13a19e81ce82": "CAKE",
 }
 
-// ─── Event ABIs ───────────────────────────────────────────────────────────────
+// ─── Event / function ABIs ────────────────────────────────────────────────────
 
 const pairCreatedABIJSON = `[{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"token0","type":"address"},{"indexed":true,"internalType":"address","name":"token1","type":"address"},{"indexed":false,"internalType":"address","name":"pair","type":"address"},{"indexed":false,"internalType":"uint256","name":"allPairsLength","type":"uint256"}],"name":"PairCreated","type":"event"}]`
 
 const poolCreatedABIJSON = `[{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"token0","type":"address"},{"indexed":true,"internalType":"address","name":"token1","type":"address"},{"indexed":true,"internalType":"uint24","name":"fee","type":"uint24"},{"indexed":false,"internalType":"int24","name":"tickSpacing","type":"int24"},{"indexed":false,"internalType":"address","name":"pool","type":"address"}],"name":"PoolCreated","type":"event"}]`
 
 const newStablePairABIJSON = `[{"anonymous":false,"inputs":[{"indexed":true,"internalType":"address","name":"token0","type":"address"},{"indexed":true,"internalType":"address","name":"token1","type":"address"},{"indexed":false,"internalType":"address","name":"pairContract","type":"address"},{"indexed":false,"internalType":"uint256","name":"A","type":"uint256"}],"name":"NewStableSwapPair","type":"event"}]`
+
+const createPairABIJSON = `[{"inputs":[{"internalType":"address","name":"tokenA","type":"address"},{"internalType":"address","name":"tokenB","type":"address"}],"name":"createPair","outputs":[{"internalType":"address","name":"pair","type":"address"}],"stateMutability":"nonpayable","type":"function"}]`
 
 // ─── Domain types ─────────────────────────────────────────────────────────────
 
@@ -54,7 +62,7 @@ type NewPairEvent struct {
 	MemeToken   string `json:"meme_token"`
 	QuoteToken  string `json:"quote_token"` // canonical-case address of the quote token
 	QuoteSymbol string `json:"quote_symbol"` // e.g. "WBNB", "USDT"
-	Source      string `json:"source"`      // "v2" | "v3" | "stable"
+	Source      string `json:"source"`      // "v2" | "v3" | "stable" | "mempool_v2"
 	FeeTier     uint32 `json:"fee_tier"`    // V3 fee tier in hundredths of a bip (500, 2500, 10000); 0 for V2/Stable
 	BlockNumber uint64 `json:"block_number"`
 	Timestamp   int64  `json:"timestamp"`
@@ -166,10 +174,22 @@ func (l *Listener) subscribe(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	createPairABI, err := abi.JSON(strings.NewReader(createPairABIJSON))
+	if err != nil {
+		return err
+	}
 
 	v2ID := v2ABI.Events["PairCreated"].ID
 	v3ID := v3ABI.Events["PoolCreated"].ID
 	stableID := stableABI.Events["NewStableSwapPair"].ID
+
+	// Start mempool V2 createPair subscription in parallel for ultra-low latency.
+	memErrCh := make(chan error, 1)
+	memCtx, memCancel := context.WithCancel(ctx)
+	defer memCancel()
+	go func() {
+		memErrCh <- l.subscribeMempoolV2(memCtx, &createPairABI)
+	}()
 
 	query := ethereum.FilterQuery{
 		Addresses: []common.Address{
@@ -182,6 +202,8 @@ func (l *Listener) subscribe(ctx context.Context) error {
 	logs := make(chan types.Log, 1024)
 	sub, err := client.SubscribeFilterLogs(ctx, query, logs)
 	if err != nil {
+		memCancel()
+		<-memErrCh
 		return err
 	}
 	defer sub.Unsubscribe()
@@ -189,13 +211,20 @@ func (l *Listener) subscribe(ctx context.Context) error {
 	l.logger.Info("subscribed to PancakeSwap V2+V3+StableSwap factories",
 		zap.Int("quote_tokens", len(quoteTokens)),
 		zap.String("v3_fee_tiers", "all (0.05%, 0.25%, 1%)"),
+		zap.String("mempool_v2", "enabled"),
 	)
 
 	for {
 		select {
 		case <-ctx.Done():
+			memCancel()
 			return nil
 		case err := <-sub.Err():
+			memCancel()
+			<-memErrCh
+			return err
+		case err := <-memErrCh:
+			memCancel()
 			return err
 		case log := <-logs:
 			if len(log.Topics) == 0 {
@@ -212,6 +241,91 @@ func (l *Listener) subscribe(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+// ─── Mempool V2 createPair subscription ────────────────────────────────────────
+
+// subscribeMempoolV2 uses eth_subscribe("newPendingTransactions") to detect
+// V2 factory createPair calls in the mempool, computes the deterministic pair
+// address via CREATE2, and immediately publishes the pair event without waiting
+// for a block. This is the primary low-latency path for V2 launches.
+func (l *Listener) subscribeMempoolV2(ctx context.Context, createPairABI *abi.ABI) error {
+	rpcClient, err := rpc.DialContext(ctx, l.wsURL)
+	if err != nil {
+		l.logger.Warn("mempool RPC dial failed", zap.Error(err))
+		return err
+	}
+	defer rpcClient.Close()
+
+	factoryAddr := common.HexToAddress(FactoryV2)
+	createPairMethod := createPairABI.Methods["createPair"]
+	selector := createPairMethod.ID
+	txHashes := make(chan common.Hash, 4096)
+	sub, err := rpcClient.EthSubscribe(ctx, txHashes, "newPendingTransactions")
+	if err != nil {
+		l.logger.Warn("mempool subscription failed", zap.Error(err))
+		return err
+	}
+	defer sub.Unsubscribe()
+
+	l.logger.Info("mempool V2 createPair listener active")
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case err := <-sub.Err():
+			return err
+		case hash := <-txHashes:
+			var tx types.Transaction
+			if err := rpcClient.CallContext(ctx, &tx, "eth_getTransactionByHash", hash); err != nil {
+				continue
+			}
+			if tx.To() == nil || *tx.To() != factoryAddr {
+				continue
+			}
+			if len(tx.Data()) < 4 || !bytes.Equal(tx.Data()[:4], selector) {
+				continue
+			}
+			// Decode createPair(tokenA, tokenB)
+			type createPairArgs struct {
+				TokenA common.Address
+				TokenB common.Address
+			}
+			var args createPairArgs
+			if err := createPairABI.UnpackIntoInterface(&args, "createPair", tx.Data()[4:]); err != nil {
+				continue
+			}
+			token0, token1 := sortTokens(args.TokenA, args.TokenB)
+			pairAddr := computeV2PairAddress(factoryAddr, token0, token1)
+
+			meme, quote, sym, ok := extractMemeAndQuote(token0.Hex(), token1.Hex())
+			if !ok {
+				continue
+			}
+
+			l.publish(ctx, token0.Hex(), token1.Hex(), pairAddr.Hex(), meme, quote, sym, "mempool_v2", 0, 0)
+		}
+	}
+}
+
+func sortTokens(a, b common.Address) (common.Address, common.Address) {
+	if bytes.Compare(a.Bytes(), b.Bytes()) < 0 {
+		return a, b
+	}
+	return b, a
+}
+
+func computeV2PairAddress(factory, token0, token1 common.Address) common.Address {
+	// PancakeSwap V2 pair address = CREATE2(factory, salt, init_code_hash)
+	// salt = keccak256(token0, token1)
+	salt := crypto.Keccak256Hash(append(token0.Bytes(), token1.Bytes()...))
+	initCodeHash := common.HexToHash(v2InitCodeHash)
+	data := append([]byte{0xff}, factory.Bytes()...)
+	data = append(data, salt.Bytes()...)
+	data = append(data, initCodeHash.Bytes()...)
+	hash := crypto.Keccak256Hash(data)
+	return common.BytesToAddress(hash.Bytes()[12:])
 }
 
 // ─── V2 handler (PairCreated) ─────────────────────────────────────────────────
@@ -327,7 +441,7 @@ func (l *Listener) publish(ctx context.Context, token0, token1, pairAddr, meme, 
 		Source:      source,
 		FeeTier:     feeTier,
 		BlockNumber: block,
-		Timestamp:   time.Now().Unix(),
+		Timestamp:   time.Now().UnixNano(),
 	}
 
 	fields := []zap.Field{
@@ -335,7 +449,7 @@ func (l *Listener) publish(ctx context.Context, token0, token1, pairAddr, meme, 
 		zap.String("meme", meme),
 		zap.String("quote", quoteSymbol),
 		zap.String("pair", pairAddr),
-		zap.Uint64("block", block),
+		zap.Int64("ns", event.Timestamp),
 	}
 	if feeTier > 0 {
 		fields = append(fields, zap.Uint32("fee_tier", feeTier))
